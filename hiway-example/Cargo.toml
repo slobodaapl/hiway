@@ -1,0 +1,18 @@
+[package]
+name = "hiway-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+example = ["dep:hiway", "dep:tokio"]
+
+[dependencies]
+hiway = { path = "../hiway", optional = true, default-features = false, features = ["example"] }
+tokio = { version = "1", optional = true, features = ["macros", "rt", "signal", "time"] }
+
+[[bin]]
+name = "hiway-demo"
+path = "src/main.rs"
+required-features = ["example"]

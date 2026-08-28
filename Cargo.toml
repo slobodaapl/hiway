@@ -1,0 +1,4 @@
+[workspace]
+members = ["hiway", "hiway-macros", "hiway-example"]
+default-members = ["hiway"]
+resolver = "2"

@@ -1,0 +1,22 @@
+[package]
+name = "hiway"
+version = "0.1.0"
+edition = "2021"
+description = "Typed in-process event buses with global transformations and typed handler dispatch"
+license = "MIT"
+
+[features]
+default = ["dispatch"]
+dispatch = ["dep:dptree"]
+# Marker feature used by the adjacent example crate.
+example = []
+
+[dependencies]
+dptree = { version = "0.5.1", optional = true }
+hiway-macros = { path = "../hiway-macros" }
+parking_lot = "0.12"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+loom = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

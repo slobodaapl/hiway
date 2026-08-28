@@ -1,0 +1,15 @@
+[package]
+name = "hiway-macros"
+version = "0.1.0"
+edition = "2021"
+description = "Derive macros for hiway event enums"
+license = "MIT"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro-crate = "2.0.2"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["derive"] }
