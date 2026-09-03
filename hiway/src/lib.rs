@@ -1,59 +1,60 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
-//! `hiway` is a typed in-process event bus. Publishers prepare transformed
-//! event batches asynchronously. A central tick commits every ready publication
-//! as one frame, then every subscriber receives its events independently.
+//! `hiway` is a bounded, typed, in-process event bus. Static transforms stream
+//! outputs depth-first and enforce capacity only at the final batch.
+//! Publishers prepare routed subscriber batches; a synchronous tick moves every
+//! completed publication into subscriber frame queues.
 //!
-//! # Tiny example
+//! The static core performs no internal heap allocation and does not choose an
+//! executor. User transforms, conversions, tags, clones, destructors, and
+//! wakers may allocate or panic.
 //!
-//! ```no_run
+//! ```
 //! use hiway::{Bus, HiwayEvent};
 //!
 //! #[derive(Clone, Debug, PartialEq, Eq)]
-//! struct TextEvent {
-//!     text: String,
-//! }
+//! struct Text(&'static str);
 //!
 //! #[derive(Clone, Debug, HiwayEvent)]
 //! enum Events {
-//!     Text(TextEvent),
+//!     Text(Text),
 //! }
 //!
-//! # async fn example() -> Result<(), hiway::RecvError> {
-//! let bus = Bus::<Events>::new();
-//! let mut texts = bus.consume::<TextEvent>();
+//! # async fn example() {
+//! let bus = Bus::default().transform(async |mut text: Text| {
+//!     text.0 = "transformed";
+//!     [text.into()]
+//! });
+//! let mut texts = bus.consume::<Text>().unwrap();
 //!
-//! bus.publish(TextEvent { text: "hello".into() }).await;
+//! bus.publish(Text("input")).await.unwrap();
 //! assert!(bus.tick());
-//! assert_eq!(texts.recv().await?.text, "hello");
-//! # Ok(())
+//! assert_eq!(texts.try_recv().unwrap(), Some(Text("transformed")));
 //! # }
 //! ```
 
 extern crate self as hiway;
 
 mod bus;
+#[cfg(feature = "dynamic")]
+mod dynamic;
 mod error;
 mod event;
-mod hub;
-mod transform;
+mod pipeline;
 
-#[cfg(feature = "dispatch")]
-mod dispatch;
-
-pub use bus::{Bus, Subscription, TypedSubscription};
-pub use error::RecvError;
+pub use bus::{
+    Bus, PublishError, Subscription, TypedSubscription, DEFAULT_FRAMES, DEFAULT_OUTPUTS,
+    DEFAULT_READY, DEFAULT_SUBSCRIBERS,
+};
+#[cfg(feature = "dynamic")]
+pub use dynamic::DynamicBus;
+pub use error::{OutputFull, ReadyFull, RecvError, SubscribersFull};
 pub use event::HiwayEvent;
 pub use hiway_macros::HiwayEvent;
-pub use hub::Hiway;
+pub use pipeline::{stage, Batch, Identity, Pipeline, PipelineExt, Stage, Then};
 
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::event::TransformInput;
+    pub use crate::event::{EventTag, TransformInput};
 }
-
-#[cfg(feature = "dispatch")]
-pub use dispatch::{Dispatcher, Listener};
-
-#[cfg(feature = "dispatch")]
-pub use dptree;

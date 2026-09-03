@@ -1,4 +1,21 @@
 [workspace]
-members = ["hiway", "hiway-macros", "hiway-example"]
+members = ["hiway", "hiway-macros", "hiway-loom"]
 default-members = ["hiway"]
 resolver = "2"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+debug = false
+debug-assertions = false
+overflow-checks = true
+incremental = false
+rpath = false
+
+[profile.release-symbols]
+inherits = "release"
+strip = "none"
+debug = "full"

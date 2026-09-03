@@ -1,13 +1,16 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    future::Future,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    task::{Context, Poll, Wake, Waker},
 };
 
-use hiway::{Bus, Hiway, HiwayEvent, RecvError};
-use tokio::{
-    sync::Notify,
-    time::{timeout, Duration},
-};
+#[cfg(feature = "dynamic")]
+use hiway::DynamicBus;
+use hiway::{stage, Batch, Bus, HiwayEvent, PipelineExt, PublishError, RecvError, SubscribersFull};
+use tokio::sync::Notify;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UiEvent {
@@ -27,17 +30,59 @@ struct LogEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Signal;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Wanted(u8);
+
+#[derive(Debug)]
+struct CountedUnrelated {
+    value: u8,
+    clones: Arc<AtomicUsize>,
+}
+
+impl Clone for CountedUnrelated {
+    fn clone(&self) -> Self {
+        self.clones.fetch_add(1, Ordering::SeqCst);
+        Self {
+            value: self.value,
+            clones: self.clones.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, HiwayEvent)]
+enum RoutedEvent {
+    Unrelated(CountedUnrelated),
+    Wanted(Wanted),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Borrowed<'a>(&'a str);
+
+#[derive(Clone, Debug, PartialEq, Eq, HiwayEvent)]
+enum BorrowedEvent<'a> {
+    Text(Borrowed<'a>),
+}
+
+struct WakeCounter {
+    calls: AtomicUsize,
+}
+
+impl Wake for WakeCounter {
+    fn wake(self: Arc<Self>) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, HiwayEvent)]
 enum Event {
     Ui(UiEvent),
     Game(GameEvent),
     Log(LogEvent),
     Signal(Signal),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, HiwayEvent)]
-enum OtherEvent {
-    Value(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,8 +96,15 @@ where
     Value(GenericPayload<T>),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ManualEvent {
+    Signal(Signal),
+}
+
+impl HiwayEvent for ManualEvent {}
+
 #[test]
-fn derive_provides_variant_conversions() {
+fn derive_provides_typed_variant_conversions() {
     let ui = UiEvent {
         text: "click".into(),
     };
@@ -60,190 +112,97 @@ fn derive_provides_variant_conversions() {
 
     assert_eq!(event, Event::Ui(ui.clone()));
     assert_eq!(UiEvent::try_from(event), Ok(ui));
-    assert_eq!(
-        UiEvent::try_from(Event::Game(GameEvent {
-            text: "move".into()
-        })),
-        Err(Event::Game(GameEvent {
-            text: "move".into()
-        }))
-    );
+    assert!(UiEvent::try_from(Event::Signal(Signal)).is_err());
+}
+
+#[test]
+fn default_bus_is_const_constructible() {
+    let bus: Bus<Event> = const { Bus::new() };
+    assert!(bus.subscribe().is_ok());
 }
 
 #[tokio::test]
 async fn generic_derive_preserves_source_where_clauses() {
     let bus = Bus::<GenericEvent<String>>::new();
-    let mut values = bus.consume::<GenericPayload<String>>();
+    let mut values = bus.consume::<GenericPayload<String>>().unwrap();
     let value = GenericPayload("value".to_owned());
 
-    bus.publish(value.clone()).await;
+    bus.publish(value.clone()).await.unwrap();
     assert!(bus.tick());
-
     assert_eq!(values.recv().await.unwrap(), value);
-    assert_eq!(
-        GenericPayload::<String>::try_from(GenericEvent::<String>::Value(value.clone())),
-        Ok(value),
-    );
 }
 
 #[tokio::test]
-async fn direct_payload_publish_reaches_independent_subscribers() {
-    let bus = Bus::<Event>::new();
-    let mut raw = bus.subscribe();
-    let mut ui = bus.consume::<UiEvent>();
-    let mut game = bus.consume::<GameEvent>();
+async fn default_bus_infers_event_type_and_supports_nonblocking_receive() {
+    let bus = Bus::default().transform(async |mut ui: UiEvent| {
+        ui.text.push_str("|transformed");
+        [ui.into()]
+    });
+    let mut raw = bus.subscribe().unwrap();
+    let mut ui = bus.consume::<UiEvent>().unwrap();
+
+    assert_eq!(raw.try_recv(), Ok(None));
+    assert_eq!(ui.try_recv(), Ok(None));
 
     bus.publish(UiEvent {
-        text: "click".into(),
+        text: "input".into(),
     })
-    .await;
+    .await
+    .unwrap();
     assert!(bus.tick());
-    bus.publish(GameEvent {
-        text: "move".into(),
-    })
-    .await;
-    assert!(bus.tick());
-
     assert_eq!(
-        raw.recv().await.unwrap(),
-        Event::Ui(UiEvent {
-            text: "click".into()
-        })
+        raw.try_recv(),
+        Ok(Some(Event::Ui(UiEvent {
+            text: "input|transformed".into()
+        })))
     );
     assert_eq!(
-        raw.recv().await.unwrap(),
-        Event::Game(GameEvent {
-            text: "move".into()
-        })
+        ui.try_recv(),
+        Ok(Some(UiEvent {
+            text: "input|transformed".into()
+        }))
     );
-    assert_eq!(
-        ui.recv().await.unwrap(),
-        UiEvent {
-            text: "click".into()
-        }
-    );
-    assert_eq!(
-        game.recv().await.unwrap(),
-        GameEvent {
-            text: "move".into()
-        }
-    );
+    assert_eq!(raw.try_recv(), Ok(None));
+    assert_eq!(ui.try_recv(), Ok(None));
 }
 
 #[tokio::test]
-async fn one_global_transform_preserves_original_and_emits_log_once() {
-    let bus = Bus::<Event>::new();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let counted = calls.clone();
-    bus.transform(move |event: Event| {
-        counted.fetch_add(1, Ordering::SeqCst);
-        let derived = match &event {
-            Event::Ui(ui) => Some(LogEvent {
-                text: format!("ui:{}", ui.text),
-            }),
-            Event::Game(game) => Some(LogEvent {
-                text: format!("game:{}", game.text),
-            }),
-            Event::Log(_) | Event::Signal(_) => None,
-        };
-        let mut events = vec![event];
-        if let Some(derived) = derived {
-            events.push(derived.into());
-        }
-        events
+async fn manual_event_supports_inferred_whole_event_transform() {
+    let bus = Bus::default().transform(async |event: ManualEvent| match event {
+        ManualEvent::Signal(_) => [ManualEvent::Signal(Signal)],
     });
+    let mut events = bus.subscribe().unwrap();
 
-    let mut raw = bus.subscribe();
-    let mut ui = bus.consume::<UiEvent>();
-    let mut game = bus.consume::<GameEvent>();
-    let mut logs = bus.consume::<LogEvent>();
-
-    bus.publish(UiEvent {
-        text: "click".into(),
-    })
-    .await;
+    bus.publish(ManualEvent::Signal(Signal)).await.unwrap();
     assert!(bus.tick());
-    bus.publish(GameEvent {
-        text: "move".into(),
-    })
-    .await;
-    assert!(bus.tick());
-
-    assert_eq!(
-        raw.recv().await.unwrap(),
-        Event::Ui(UiEvent {
-            text: "click".into()
-        })
-    );
-    assert_eq!(
-        raw.recv().await.unwrap(),
-        Event::Log(LogEvent {
-            text: "ui:click".into()
-        })
-    );
-    assert_eq!(
-        raw.recv().await.unwrap(),
-        Event::Game(GameEvent {
-            text: "move".into()
-        })
-    );
-    assert_eq!(
-        raw.recv().await.unwrap(),
-        Event::Log(LogEvent {
-            text: "game:move".into()
-        })
-    );
-    assert_eq!(
-        ui.recv().await.unwrap(),
-        UiEvent {
-            text: "click".into()
-        }
-    );
-    assert_eq!(
-        game.recv().await.unwrap(),
-        GameEvent {
-            text: "move".into()
-        }
-    );
-    assert_eq!(
-        logs.recv().await.unwrap(),
-        LogEvent {
-            text: "ui:click".into()
-        }
-    );
-    assert_eq!(
-        logs.recv().await.unwrap(),
-        LogEvent {
-            text: "game:move".into()
-        }
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(events.try_recv(), Ok(Some(ManualEvent::Signal(Signal))));
 }
 
 #[tokio::test]
-async fn publish_prepares_without_delivery_until_tick() {
+async fn publication_waits_for_tick_and_wakes_the_receiver() {
     let bus = Bus::<Event>::new();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let counted = calls.clone();
-    bus.transform(move |event: Event| {
-        counted.fetch_add(1, Ordering::SeqCst);
-        vec![event]
-    });
-    let mut events = bus.subscribe();
+    let mut events = bus.subscribe().unwrap();
 
     bus.publish(UiEvent {
         text: "waiting".into(),
     })
-    .await;
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    .await
+    .unwrap();
 
-    assert!(timeout(Duration::from_millis(10), events.recv())
-        .await
-        .is_err());
+    let wake = Arc::new(WakeCounter {
+        calls: AtomicUsize::new(0),
+    });
+    let waker = Waker::from(wake.clone());
+    let mut context = Context::from_waker(&waker);
+    let mut receiving = Box::pin(events.recv());
+    assert!(matches!(
+        receiving.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
     assert!(bus.tick());
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(wake.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
-        events.recv().await.unwrap(),
+        receiving.await.unwrap(),
         Event::Ui(UiEvent {
             text: "waiting".into()
         })
@@ -251,31 +210,47 @@ async fn publish_prepares_without_delivery_until_tick() {
     assert!(!bus.tick());
 }
 
-#[tokio::test]
-async fn one_tick_commits_every_ready_publication_as_one_frame() {
+#[test]
+fn try_recv_clears_waker_retained_by_cancelled_receive() {
     let bus = Bus::<Event>::new();
-    bus.transform(|ui: UiEvent| {
-        vec![
-            ui.into(),
-            LogEvent {
-                text: "derived".into(),
-            }
-            .into(),
-        ]
+    let mut events = bus.subscribe().unwrap();
+    let wake = Arc::new(WakeCounter {
+        calls: AtomicUsize::new(0),
     });
+    let waker = Waker::from(wake.clone());
+    let mut context = Context::from_waker(&waker);
+    let mut receiving = Box::pin(events.recv());
 
-    let mut events = bus.subscribe();
+    assert!(matches!(
+        receiving.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    drop(receiving);
+    drop(waker);
+    assert_eq!(Arc::strong_count(&wake), 2);
+
+    assert_eq!(events.try_recv(), Ok(None));
+    assert_eq!(Arc::strong_count(&wake), 1);
+}
+
+#[tokio::test]
+async fn one_tick_commits_every_ready_publication_in_order() {
+    let bus = Bus::<Event>::new();
+    let mut events = bus.subscribe().unwrap();
+
     bus.publish(UiEvent {
         text: "first".into(),
     })
-    .await;
-    bus.publish(UiEvent {
+    .await
+    .unwrap();
+    bus.publish(GameEvent {
         text: "second".into(),
     })
-    .await;
-
+    .await
+    .unwrap();
     assert!(bus.tick());
     assert!(!bus.tick());
+
     assert_eq!(
         events.recv().await.unwrap(),
         Event::Ui(UiEvent {
@@ -284,62 +259,38 @@ async fn one_tick_commits_every_ready_publication_as_one_frame() {
     );
     assert_eq!(
         events.recv().await.unwrap(),
-        Event::Log(LogEvent {
-            text: "derived".into()
-        })
-    );
-    assert_eq!(
-        events.recv().await.unwrap(),
-        Event::Ui(UiEvent {
+        Event::Game(GameEvent {
             text: "second".into()
-        })
-    );
-    assert_eq!(
-        events.recv().await.unwrap(),
-        Event::Log(LogEvent {
-            text: "derived".into()
         })
     );
 }
 
 #[tokio::test]
-async fn emitted_events_visit_later_stages_in_order() {
-    let bus = Bus::<Event>::new();
-    let first_calls = Arc::new(AtomicUsize::new(0));
-    let later_calls = Arc::new(AtomicUsize::new(0));
-
-    let first_counted = first_calls.clone();
-    bus.transform(move |event: Event| {
-        first_counted.fetch_add(1, Ordering::SeqCst);
-        match event {
-            Event::Ui(ui) => vec![
-                Event::Ui(ui),
-                LogEvent {
-                    text: "scrubbed".into(),
-                }
-                .into(),
-            ],
-            other => vec![other],
-        }
+async fn typed_stages_expand_then_transform_in_stage_order() {
+    let expand = stage(|ui: UiEvent| async move {
+        let log = LogEvent {
+            text: format!("log:{}", ui.text),
+        };
+        [Event::Ui(ui), log.into()]
     });
-
-    let later_counted = later_calls.clone();
-    bus.transform(move |mut event: Event| {
-        later_counted.fetch_add(1, Ordering::SeqCst);
+    let suffix = stage(|mut event: Event| async move {
         match &mut event {
             Event::Ui(ui) => ui.text.push_str("|later"),
-            Event::Log(log) => log.text.push_str("|later"),
             Event::Game(game) => game.text.push_str("|later"),
+            Event::Log(log) => log.text.push_str("|later"),
             Event::Signal(_) => {}
         }
-        vec![event]
+        [event]
     });
+    let bus = Bus::<Event>::with_pipeline(expand.then(suffix));
+    let mut raw = bus.subscribe().unwrap();
+    let mut logs = bus.consume::<LogEvent>().unwrap();
 
-    let mut raw = bus.subscribe();
     bus.publish(UiEvent {
         text: "input".into(),
     })
-    .await;
+    .await
+    .unwrap();
     assert!(bus.tick());
 
     assert_eq!(
@@ -351,282 +302,425 @@ async fn emitted_events_visit_later_stages_in_order() {
     assert_eq!(
         raw.recv().await.unwrap(),
         Event::Log(LogEvent {
-            text: "scrubbed|later".into()
+            text: "log:input|later".into()
         })
     );
-    assert_eq!(first_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(later_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        logs.recv().await.unwrap(),
+        LogEvent {
+            text: "log:input|later".into()
+        }
+    );
 }
 
 #[tokio::test]
-async fn variant_transforms_target_payloads_and_preserve_other_variants() {
-    let bus = Bus::<Event>::new();
-    bus.transform(|mut ui: UiEvent| {
-        ui.text.push_str("|mapped");
-        vec![ui.into()]
-    });
-    bus.transform(|ui: UiEvent| {
-        vec![
-            ui.clone().into(),
+async fn subscribers_keep_independent_cursors() {
+    let pipeline = stage(|ui: UiEvent| async move {
+        [
+            Event::Ui(ui),
             LogEvent {
-                text: format!("ui:{}", ui.text),
+                text: "derived".into(),
             }
             .into(),
         ]
     });
-    bus.transform(|game: GameEvent| {
-        if game.text == "drop" {
-            Vec::new()
-        } else {
-            vec![game.into()]
+    let bus: Bus<Event, 2, 2, 2, 2, _> = Bus::with_pipeline(pipeline);
+    let mut first = bus.subscribe().unwrap();
+    let mut second = bus.subscribe().unwrap();
+
+    bus.publish(UiEvent { text: "one".into() }).await.unwrap();
+    assert!(bus.tick());
+
+    assert!(matches!(first.recv().await.unwrap(), Event::Ui(_)));
+    assert!(matches!(second.recv().await.unwrap(), Event::Ui(_)));
+    assert!(matches!(second.recv().await.unwrap(), Event::Log(_)));
+    assert!(matches!(first.recv().await.unwrap(), Event::Log(_)));
+}
+
+#[tokio::test]
+async fn completed_publication_is_rejected_whole_when_ready_is_full() {
+    let bus = Bus::<Event, 2, 1, 2, 1>::new();
+    let mut events = bus.subscribe().unwrap();
+
+    bus.publish(UiEvent { text: "one".into() }).await.unwrap();
+    let Err(PublishError::ReadyFull(full)) = bus.publish(UiEvent { text: "two".into() }).await
+    else {
+        panic!("the second publication must return its prepared batch");
+    };
+    let retry = full.into_batch();
+    assert!(bus.tick());
+    assert_eq!(
+        events.recv().await.unwrap(),
+        Event::Ui(UiEvent { text: "one".into() })
+    );
+
+    bus.try_submit(retry).unwrap();
+    assert!(bus.tick());
+    assert_eq!(
+        events.recv().await.unwrap(),
+        Event::Ui(UiEvent { text: "two".into() })
+    );
+}
+
+#[tokio::test]
+async fn retrying_ready_full_batch_does_not_replay_transform() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let transform_calls = calls.clone();
+    let pipeline = stage(move |ui: UiEvent| {
+        let call = transform_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        async move {
+            [Event::Ui(UiEvent {
+                text: format!("{}-{call}", ui.text),
+            })]
         }
     });
+    let bus: Bus<Event, 1, 1, 2, 1, _> = Bus::with_pipeline(pipeline);
+    let mut events = bus.subscribe().unwrap();
 
-    let mut events = bus.subscribe();
-    bus.publish(UiEvent {
-        text: "input".into(),
-    })
-    .await;
+    bus.publish(UiEvent { text: "one".into() }).await.unwrap();
+    let Err(PublishError::ReadyFull(full)) = bus.publish(UiEvent { text: "two".into() }).await
+    else {
+        panic!("the second publication must return its prepared batch");
+    };
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
     assert!(bus.tick());
-    bus.publish(GameEvent {
-        text: "drop".into(),
-    })
-    .await;
-    assert!(!bus.tick());
-
+    bus.try_submit(full.into_batch()).unwrap();
+    assert!(bus.tick());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         events.recv().await.unwrap(),
         Event::Ui(UiEvent {
-            text: "input|mapped".into()
+            text: "one-1".into()
         })
     );
     assert_eq!(
         events.recv().await.unwrap(),
-        Event::Log(LogEvent {
-            text: "ui:input|mapped".into()
+        Event::Ui(UiEvent {
+            text: "two-2".into()
         })
     );
 }
 
+#[cfg(feature = "dynamic")]
 #[tokio::test]
-async fn transform_infers_bus_input_and_mixed_outputs() {
-    let bus = Bus::new();
-    bus.transform(|mut ui: UiEvent| {
-        ui.text.push_str("|mutated");
-        let log = LogEvent {
-            text: format!("ui:{}", ui.text),
-        };
-        vec![ui.into(), log.into()]
+async fn dynamic_retry_does_not_replay_runtime_transform() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let transform_calls = calls.clone();
+    let bus: DynamicBus<Event, 1, 1, 2, 1> = DynamicBus::new();
+    bus.transform(move |ui: UiEvent| {
+        let call = transform_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        async move {
+            [Event::Ui(UiEvent {
+                text: format!("{}-{call}", ui.text),
+            })]
+        }
     });
+    let mut events = bus.subscribe().unwrap();
 
-    let mut events = bus.subscribe();
-    bus.publish(UiEvent {
-        text: "input".into(),
-    })
-    .await;
-    assert!(bus.tick());
-    bus.publish(Signal).await;
-    assert!(bus.tick());
+    bus.publish(UiEvent { text: "one".into() }).await.unwrap();
+    let Err(PublishError::ReadyFull(full)) = bus.publish(UiEvent { text: "two".into() }).await
+    else {
+        panic!("the second publication must return its prepared batch");
+    };
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 
+    assert!(bus.tick());
+    bus.try_submit(full.into_batch()).unwrap();
+    assert!(bus.tick());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
-        events.recv().await.unwrap(),
-        Event::Ui(UiEvent {
-            text: "input|mutated".into()
-        })
+        events.try_recv(),
+        Ok(Some(Event::Ui(UiEvent {
+            text: "one-1".into()
+        })))
     );
     assert_eq!(
-        events.recv().await.unwrap(),
-        Event::Log(LogEvent {
-            text: "ui:input|mutated".into()
-        })
+        events.try_recv(),
+        Ok(Some(Event::Ui(UiEvent {
+            text: "two-2".into()
+        })))
     );
-    assert_eq!(events.recv().await.unwrap(), Event::Signal(Signal));
 }
 
 #[tokio::test]
-async fn async_transforms_preserve_explicit_original_events() {
-    let bus = Bus::<Event>::new();
-    bus.transform_async(|event: Event| async move {
-        match event {
-            Event::Ui(ui) => {
-                let log = LogEvent {
-                    text: format!("async:{}", ui.text),
-                };
-                vec![Event::Ui(ui), log.into()]
+async fn typed_routes_skip_unrelated_events_before_clone_storage_and_lag() {
+    let clones = Arc::new(AtomicUsize::new(0));
+    let bus = Bus::<RoutedEvent, 1, 4, 1, 2>::new();
+    let mut raw = bus.subscribe().unwrap();
+    let mut wanted = bus.consume::<Wanted>().unwrap();
+    let wake = Arc::new(WakeCounter {
+        calls: AtomicUsize::new(0),
+    });
+    let waker = Waker::from(wake.clone());
+    let mut context = Context::from_waker(&waker);
+    let mut receiving = Box::pin(wanted.recv());
+    assert!(matches!(
+        receiving.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+
+    for value in [1, 2] {
+        bus.publish(CountedUnrelated {
+            value,
+            clones: clones.clone(),
+        })
+        .await
+        .unwrap();
+        assert!(bus.tick());
+        assert!(matches!(
+            raw.recv().await.unwrap(),
+            RoutedEvent::Unrelated(_)
+        ));
+    }
+    assert_eq!(clones.load(Ordering::SeqCst), 0);
+    assert_eq!(wake.calls.load(Ordering::SeqCst), 0);
+
+    bus.publish(Wanted(7)).await.unwrap();
+    assert!(bus.tick());
+    assert!(matches!(
+        raw.recv().await.unwrap(),
+        RoutedEvent::Wanted(Wanted(7))
+    ));
+    assert_eq!(
+        receiving.as_mut().poll(&mut context),
+        Poll::Ready(Ok(Wanted(7)))
+    );
+}
+
+#[tokio::test]
+async fn fanout_clones_each_event_once_per_additional_matching_subscriber() {
+    let clones = Arc::new(AtomicUsize::new(0));
+    let bus = Bus::<RoutedEvent, 1, 1, 1, 3>::new();
+    let mut first = bus.subscribe().unwrap();
+    let mut second = bus.subscribe().unwrap();
+    let mut third = bus.subscribe().unwrap();
+
+    bus.publish(CountedUnrelated {
+        value: 7,
+        clones: clones.clone(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(clones.load(Ordering::SeqCst), 2);
+    assert!(bus.tick());
+    assert!(matches!(
+        first.try_recv(),
+        Ok(Some(RoutedEvent::Unrelated(_)))
+    ));
+    assert!(matches!(
+        second.try_recv(),
+        Ok(Some(RoutedEvent::Unrelated(_)))
+    ));
+    assert!(matches!(
+        third.try_recv(),
+        Ok(Some(RoutedEvent::Unrelated(_)))
+    ));
+}
+
+#[tokio::test]
+async fn subscriber_created_after_preparation_misses_publication() {
+    let bus = Bus::<Event, 1, 2, 1, 1>::new();
+    bus.publish(UiEvent { text: "old".into() }).await.unwrap();
+    let mut events = bus.subscribe().unwrap();
+    assert!(bus.tick());
+
+    let wake = Arc::new(WakeCounter {
+        calls: AtomicUsize::new(0),
+    });
+    let waker = Waker::from(wake);
+    let mut context = Context::from_waker(&waker);
+    let mut receiving = Box::pin(events.recv());
+    assert!(matches!(
+        receiving.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+
+    bus.publish(UiEvent { text: "new".into() }).await.unwrap();
+    assert!(bus.tick());
+    assert_eq!(
+        receiving.as_mut().poll(&mut context),
+        Poll::Ready(Ok(Event::Ui(UiEvent { text: "new".into() })))
+    );
+}
+
+#[tokio::test]
+async fn borrowed_events_do_not_require_static_lifetime() {
+    let text = String::from("borrowed");
+    let bus = Bus::<BorrowedEvent<'_>>::new();
+    let mut events = bus.consume::<Borrowed<'_>>().unwrap();
+
+    bus.publish(Borrowed(text.as_str())).await.unwrap();
+    assert!(bus.tick());
+    assert_eq!(events.recv().await.unwrap(), Borrowed("borrowed"));
+}
+
+#[tokio::test]
+async fn zero_subscriber_capacity_still_accepts_and_ticks_publications() {
+    let bus = Bus::<Event, 1, 1, 1, 0>::new();
+    assert!(matches!(bus.subscribe(), Err(SubscribersFull)));
+    assert!(bus.publish(Signal).await.is_ok());
+    assert!(bus.tick());
+}
+
+#[tokio::test]
+async fn transform_output_overflow_publishes_nothing() {
+    let pipeline = stage(|ui: UiEvent| async move {
+        [
+            Event::Ui(ui),
+            LogEvent {
+                text: "too many".into(),
             }
-            other => vec![other],
-        }
+            .into(),
+        ]
     });
-    bus.transform_async(|ui: UiEvent| async move {
-        let log = LogEvent {
-            text: format!("variant:{}", ui.text),
-        };
-        vec![ui.into(), log.into()]
-    });
+    let bus: Bus<Event, 1, 2, 1, 1, _> = Bus::with_pipeline(pipeline);
 
-    let mut events = bus.subscribe();
-    bus.publish(UiEvent {
-        text: "input".into(),
-    })
-    .await;
-    assert!(bus.tick());
-
-    assert_eq!(
-        events.recv().await.unwrap(),
-        Event::Ui(UiEvent {
+    assert!(matches!(
+        bus.publish(UiEvent {
             text: "input".into()
         })
-    );
-    assert_eq!(
-        events.recv().await.unwrap(),
-        Event::Log(LogEvent {
-            text: "variant:input".into()
-        })
-    );
-    assert_eq!(
-        events.recv().await.unwrap(),
-        Event::Log(LogEvent {
-            text: "async:input".into()
-        })
-    );
+        .await,
+        Err(PublishError::OutputFull)
+    ));
+    assert!(!bus.tick());
 }
 
 #[tokio::test]
-async fn global_filter_drops_events_for_every_subscriber() {
-    let bus = Bus::<Event>::new();
-    bus.transform(|event: Event| match event {
-        Event::Game(_) => Vec::new(),
-        other => vec![other],
-    });
+async fn subscriber_slots_are_bounded_and_reusable() {
+    let bus = Bus::<Event, 1, 1, 1, 1>::new();
+    let first = bus.subscribe().unwrap();
+    assert!(matches!(bus.subscribe(), Err(SubscribersFull)));
+    drop(first);
+    assert!(bus.subscribe().is_ok());
+}
 
-    let mut first = bus.subscribe();
-    let mut second = bus.subscribe();
-    bus.publish(GameEvent {
-        text: "hidden".into(),
-    })
-    .await;
-    assert!(!bus.tick());
-    bus.publish(UiEvent {
-        text: "visible".into(),
-    })
-    .await;
+#[tokio::test]
+async fn lag_reports_overwritten_tick_frames() {
+    let bus = Bus::<Event, 1, 1, 1, 1>::new();
+    let mut events = bus.subscribe().unwrap();
+
+    bus.publish(UiEvent { text: "one".into() }).await.unwrap();
+    assert!(bus.tick());
+    bus.publish(UiEvent { text: "two".into() }).await.unwrap();
     assert!(bus.tick());
 
-    let expected = Event::Ui(UiEvent {
-        text: "visible".into(),
-    });
-    assert_eq!(first.recv().await.unwrap(), expected);
-    assert_eq!(second.recv().await.unwrap(), expected);
-}
-
-#[tokio::test]
-async fn async_filter_waits_and_controls_delivery() {
-    let bus = Bus::<Event>::new();
-    bus.transform_async(|event: Event| async move {
-        match event {
-            Event::Ui(ui) if ui.text == "keep" => vec![Event::Ui(ui)],
-            _ => Vec::new(),
-        }
-    });
-
-    let mut events = bus.subscribe();
-    bus.publish(UiEvent {
-        text: "drop".into(),
-    })
-    .await;
-    assert!(!bus.tick());
-    bus.publish(UiEvent {
-        text: "keep".into(),
-    })
-    .await;
-    assert!(bus.tick());
-
+    assert_eq!(events.recv().await, Err(RecvError::Lagged(1)));
     assert_eq!(
         events.recv().await.unwrap(),
-        Event::Ui(UiEvent {
-            text: "keep".into()
-        })
+        Event::Ui(UiEvent { text: "two".into() })
     );
 }
 
 #[tokio::test]
-async fn blocked_transform_does_not_block_another_publication_or_tick() {
+async fn frame_ring_wraparound_reports_every_overwritten_frame() {
+    let bus = Bus::<Event, 1, 1, 2, 1>::new();
+    let mut events = bus.subscribe().unwrap();
+
+    for text in ["one", "two", "three", "four"] {
+        bus.publish(UiEvent { text: text.into() }).await.unwrap();
+        assert!(bus.tick());
+    }
+
+    assert_eq!(events.try_recv(), Err(RecvError::Lagged(2)));
+    assert_eq!(
+        events.try_recv(),
+        Ok(Some(Event::Ui(UiEvent {
+            text: "three".into()
+        })))
+    );
+    assert_eq!(
+        events.try_recv(),
+        Ok(Some(Event::Ui(UiEvent {
+            text: "four".into()
+        })))
+    );
+    assert_eq!(events.try_recv(), Ok(None));
+}
+
+#[tokio::test]
+async fn consumed_frames_do_not_count_as_lag() {
+    let bus = Bus::<Event, 1, 1, 1, 1>::new();
+    let mut events = bus.subscribe().unwrap();
+
+    bus.publish(UiEvent { text: "one".into() }).await.unwrap();
+    assert!(bus.tick());
+    assert_eq!(
+        events.recv().await.unwrap(),
+        Event::Ui(UiEvent { text: "one".into() })
+    );
+
+    bus.publish(UiEvent { text: "two".into() }).await.unwrap();
+    assert!(bus.tick());
+    assert_eq!(
+        events.recv().await.unwrap(),
+        Event::Ui(UiEvent { text: "two".into() })
+    );
+}
+
+#[tokio::test]
+async fn publishing_without_subscribers_is_valid_and_not_replayed() {
     let bus = Bus::<Event>::new();
+    bus.publish(Signal).await.unwrap();
+    assert!(bus.tick());
+
+    let mut events = bus.subscribe().unwrap();
+    bus.publish(UiEvent { text: "new".into() }).await.unwrap();
+    assert!(bus.tick());
+    assert_eq!(
+        events.recv().await.unwrap(),
+        Event::Ui(UiEvent { text: "new".into() })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suspended_transform_does_not_block_other_publishers_or_tick() {
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let transform_entered = entered.clone();
     let transform_release = release.clone();
-    bus.transform_async(move |event: Event| {
+    let pipeline = stage(move |event: Event| {
         let entered = transform_entered.clone();
         let release = transform_release.clone();
         async move {
-            match event {
+            match &event {
                 Event::Ui(ui) if ui.text == "slow" => {
                     entered.notify_one();
                     release.notified().await;
-                    vec![Event::Ui(ui)]
                 }
-                other => vec![other],
+                _ => {}
             }
+            [event]
         }
     });
+    let bus = Arc::new(Bus::<Event, 1, 2, 2, 1, _>::with_pipeline(pipeline));
+    let mut events = bus.subscribe().unwrap();
 
-    let mut events = bus.subscribe();
     let slow_bus = bus.clone();
-    let slow_publish = tokio::spawn(async move {
+    let slow = tokio::spawn(async move {
         slow_bus
             .publish(UiEvent {
                 text: "slow".into(),
             })
-            .await;
+            .await
     });
     entered.notified().await;
 
     let fast_bus = bus.clone();
-    let mut fast_publish = tokio::spawn(async move {
-        fast_bus
+    let fast_done = Arc::new(Notify::new());
+    let fast_finished = fast_done.clone();
+    let fast = tokio::spawn(async move {
+        let result = fast_bus
             .publish(UiEvent {
                 text: "fast".into(),
             })
             .await;
+        fast_finished.notify_one();
+        result
     });
-    match timeout(Duration::from_secs(1), &mut fast_publish).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            release.notify_one();
-            slow_publish.await.unwrap();
-            panic!("fast publication task failed: {error}");
-        }
-        Err(_) => {
-            release.notify_one();
-            slow_publish.await.unwrap();
-            let _ = fast_publish.await;
-            panic!("fast publication remained blocked by slow transform");
-        }
-    }
-
-    let tick_bus = bus.clone();
-    let mut ticking = tokio::task::spawn_blocking(move || tick_bus.tick());
-    let ticked = match timeout(Duration::from_secs(1), &mut ticking).await {
-        Ok(Ok(ticked)) => ticked,
-        Ok(Err(error)) => {
-            release.notify_one();
-            slow_publish.await.unwrap();
-            panic!("tick task failed: {error}");
-        }
-        Err(_) => {
-            release.notify_one();
-            slow_publish.await.unwrap();
-            let _ = ticking.await;
-            panic!("tick remained blocked while slow transform was pending");
-        }
-    };
-    if !ticked {
-        release.notify_one();
-        slow_publish.await.unwrap();
-        panic!("tick did not commit the prepared fast publication");
-    }
-
+    fast_done.notified().await;
+    fast.await.unwrap().unwrap();
+    assert!(bus.tick());
     assert_eq!(
         events.recv().await.unwrap(),
         Event::Ui(UiEvent {
@@ -635,7 +729,7 @@ async fn blocked_transform_does_not_block_another_publication_or_tick() {
     );
 
     release.notify_one();
-    slow_publish.await.unwrap();
+    slow.await.unwrap().unwrap();
     assert!(bus.tick());
     assert_eq!(
         events.recv().await.unwrap(),
@@ -645,49 +739,43 @@ async fn blocked_transform_does_not_block_another_publication_or_tick() {
     );
 }
 
-#[tokio::test]
-async fn transform_append_is_snapshotted_per_publication() {
-    let bus = Bus::<Event>::new();
+#[cfg(feature = "dynamic")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dynamic_pipeline_snapshots_runtime_stages_before_awaiting() {
+    let bus = Arc::new(DynamicBus::<Event>::new());
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
-    let invocations = Arc::new(AtomicUsize::new(0));
     let transform_entered = entered.clone();
     let transform_release = release.clone();
-    let transform_invocations = invocations.clone();
 
-    bus.transform_async(move |mut event: Event| {
+    bus.transform(move |mut event: Event| {
         let entered = transform_entered.clone();
         let release = transform_release.clone();
-        let invocations = transform_invocations.clone();
         async move {
-            if invocations.fetch_add(1, Ordering::SeqCst) == 0 {
-                entered.notify_one();
-                release.notified().await;
-            }
+            entered.notify_one();
+            release.notified().await;
             if let Event::Ui(ui) = &mut event {
                 ui.text.push_str("|first");
             }
-            vec![event]
+            [event]
         }
     });
 
-    let mut events = bus.subscribe();
+    let mut events = bus.subscribe().unwrap();
     let publishing = bus.clone();
-    let first_publication = tokio::spawn(async move {
-        publishing.publish(UiEvent { text: "one".into() }).await;
-    });
-
+    let first =
+        tokio::spawn(async move { publishing.publish(UiEvent { text: "one".into() }).await });
     entered.notified().await;
-    bus.transform(|mut event: Event| {
+
+    bus.transform(|mut event: Event| async move {
         if let Event::Ui(ui) = &mut event {
             ui.text.push_str("|second");
         }
-        vec![event]
+        [event]
     });
     release.notify_one();
-    first_publication.await.unwrap();
+    first.await.unwrap().unwrap();
     assert!(bus.tick());
-
     assert_eq!(
         events.recv().await.unwrap(),
         Event::Ui(UiEvent {
@@ -695,7 +783,8 @@ async fn transform_append_is_snapshotted_per_publication() {
         })
     );
 
-    bus.publish(UiEvent { text: "two".into() }).await;
+    release.notify_one();
+    bus.publish(UiEvent { text: "two".into() }).await.unwrap();
     assert!(bus.tick());
     assert_eq!(
         events.recv().await.unwrap(),
@@ -705,78 +794,8 @@ async fn transform_append_is_snapshotted_per_publication() {
     );
 }
 
-#[tokio::test]
-async fn registry_keeps_event_types_independent() {
-    let hiway = Hiway::new();
-    let events: Bus<Event> = hiway.bus();
-    let other: Bus<OtherEvent> = hiway.bus();
-    let mut event_subscriber = events.subscribe();
-    let mut other_subscriber = other.subscribe();
-
-    events.publish(Signal).await;
-    assert!(events.tick());
-    other.publish(OtherEvent::Value("other".into())).await;
-    assert!(other.tick());
-
-    assert_eq!(
-        event_subscriber.recv().await.unwrap(),
-        Event::Signal(Signal)
-    );
-    assert_eq!(
-        other_subscriber.recv().await.unwrap(),
-        OtherEvent::Value("other".into())
-    );
-}
-
-#[tokio::test]
-async fn registry_reuses_the_typed_bus_and_transform_configuration() {
-    let hiway = Hiway::new();
-    let first = hiway.bus();
-    let second: Bus<Event> = hiway.bus();
-    first.transform(|mut event: Event| {
-        if let Event::Ui(ui) = &mut event {
-            ui.text.push_str("|shared");
-        }
-        vec![event]
-    });
-
-    let mut events = second.subscribe();
-    second
-        .publish(UiEvent {
-            text: "input".into(),
-        })
-        .await;
-    assert!(second.tick());
-
-    assert_eq!(
-        events.recv().await.unwrap(),
-        Event::Ui(UiEvent {
-            text: "input|shared".into()
-        })
-    );
-}
-
-#[tokio::test]
-async fn lag_is_reported_by_raw_subscriptions() {
-    let bus = Bus::<Event>::with_capacity(1);
-    bus.transform(|ui: UiEvent| {
-        vec![
-            ui.into(),
-            LogEvent {
-                text: "derived".into(),
-            }
-            .into(),
-        ]
-    });
-    let mut events = bus.subscribe();
-    bus.publish(UiEvent { text: "one".into() }).await;
-    bus.publish(UiEvent {
-        text: "one-more".into(),
-    })
-    .await;
-    assert!(bus.tick());
-    bus.publish(UiEvent { text: "two".into() }).await;
-    assert!(bus.tick());
-
-    assert_eq!(events.recv().await, Err(RecvError::Lagged(1)));
+#[test]
+fn batch_collection_never_truncates() {
+    assert_eq!(Batch::<u8, 2>::try_from_iter([1, 2]).unwrap().len(), 2);
+    assert!(Batch::<u8, 1>::try_from_iter([1, 2]).is_err());
 }

@@ -1,11 +1,17 @@
+//! Animated terminal demonstration of routing and a custom terminal pipeline.
+
 use std::{
     collections::VecDeque,
     io::{self, IsTerminal, Write},
     time::{Duration, Instant},
 };
 
-use hiway::{Bus, RecvError, TypedSubscription};
+use hiway::{Batch, Bus, OutputFull, Pipeline, RecvError, TypedSubscription};
 use tokio::time::{interval, sleep};
+
+const fn ensure_send<F: std::future::Future + Send>(future: F) -> F {
+    future
+}
 
 const MESSAGE: &str = "HIWAY EVENTS FLOW THROUGH TRANSFORMS   ";
 const BILLBOARD_WIDTH: usize = 41;
@@ -38,6 +44,37 @@ enum Events {
     RgbaCount(RgbaCountEvent),
     UiCountUpdate(UiCountUpdateEvent),
 }
+
+struct ColorPipeline {
+    epoch: Instant,
+}
+
+impl Pipeline<Events, 4> for ColorPipeline {
+    fn apply<'a>(
+        &'a self,
+        event: Events,
+    ) -> impl std::future::Future<Output = Result<Batch<Events, 4>, OutputFull>> + Send + 'a
+    where
+        Events: 'a,
+    {
+        ensure_send(async move {
+            match event {
+                Events::Character(mut character) => {
+                    let color = Colorizer::at(self.epoch.elapsed());
+                    character.text = color.apply(&character.text);
+                    Batch::try_from_iter([
+                        character.into(),
+                        RgbaCountEvent::from_colorizer(color).into(),
+                    ])
+                }
+                other => Batch::try_from_iter([other]),
+            }
+        })
+    }
+}
+
+type DemoBus = Bus<Events, 4, 8, 4, 4, ColorPipeline>;
+type DemoSubscription<'a, V> = TypedSubscription<'a, Events, V, 4, 8, 4, 4>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Colorizer {
@@ -155,20 +192,20 @@ enum Stage {
     Delivered,
 }
 
-struct CharacterProducer {
-    bus: Bus<Events>,
+struct CharacterProducer<'a> {
+    bus: &'a DemoBus,
     message: std::iter::Cycle<std::str::Chars<'static>>,
 }
 
-impl CharacterProducer {
-    fn new(bus: &Bus<Events>) -> Self {
+impl<'a> CharacterProducer<'a> {
+    fn new(bus: &'a DemoBus) -> Self {
         Self {
-            bus: bus.clone(),
+            bus,
             message: MESSAGE.chars().cycle(),
         }
     }
 
-    async fn publish_next(&mut self) {
+    async fn publish_next(&mut self) -> DemoResult {
         let character = self
             .message
             .next()
@@ -177,38 +214,39 @@ impl CharacterProducer {
             .publish(CharacterEvent {
                 text: character.to_string(),
             })
-            .await;
+            .await?;
+        Ok(())
     }
 
     async fn run(mut self) -> DemoResult {
         loop {
-            self.publish_next().await;
+            self.publish_next().await?;
             sleep(PRODUCER_INTERVAL).await;
         }
     }
 }
 
-struct CountKeeper {
-    bus: Bus<Events>,
-    rgba_events: TypedSubscription<Events, RgbaCountEvent>,
+struct CountKeeper<'a> {
+    bus: &'a DemoBus,
+    rgba_events: DemoSubscription<'a, RgbaCountEvent>,
     totals: RgbaCountEvent,
 }
 
-impl CountKeeper {
-    fn new(bus: &Bus<Events>) -> Self {
-        Self {
-            bus: bus.clone(),
-            rgba_events: bus.consume::<RgbaCountEvent>(),
+impl<'a> CountKeeper<'a> {
+    fn new(bus: &'a DemoBus) -> Result<Self, hiway::SubscribersFull> {
+        Ok(Self {
+            bus,
+            rgba_events: bus.consume::<RgbaCountEvent>()?,
             totals: RgbaCountEvent::default(),
-        }
+        })
     }
 
-    async fn update(&mut self) -> Result<(), RecvError> {
+    async fn update(&mut self) -> DemoResult {
         let delta = self.rgba_events.recv().await?;
         self.totals.accumulate(delta);
         self.bus
             .publish(UiCountUpdateEvent::from_totals(self.totals))
-            .await;
+            .await?;
         Ok(())
     }
 
@@ -219,25 +257,25 @@ impl CountKeeper {
     }
 }
 
-struct TerminalUi {
-    character_events: TypedSubscription<Events, CharacterEvent>,
-    count_updates: TypedSubscription<Events, UiCountUpdateEvent>,
+struct TerminalUi<'a> {
+    character_events: DemoSubscription<'a, CharacterEvent>,
+    count_updates: DemoSubscription<'a, UiCountUpdateEvent>,
     billboard: VecDeque<(Colorizer, char)>,
     delivered: u64,
     counts: UiCountUpdateEvent,
     pending_character: Option<(char, Colorizer, CharacterEvent)>,
 }
 
-impl TerminalUi {
-    fn new(bus: &Bus<Events>) -> Self {
-        Self {
-            character_events: bus.consume::<CharacterEvent>(),
-            count_updates: bus.consume::<UiCountUpdateEvent>(),
+impl<'a> TerminalUi<'a> {
+    fn new(bus: &'a DemoBus) -> Result<Self, hiway::SubscribersFull> {
+        Ok(Self {
+            character_events: bus.consume::<CharacterEvent>()?,
+            count_updates: bus.consume::<UiCountUpdateEvent>()?,
             billboard: VecDeque::with_capacity(BILLBOARD_WIDTH),
             delivered: 0,
             counts: UiCountUpdateEvent::default(),
             pending_character: None,
-        }
+        })
     }
 
     async fn receive_character(&mut self) -> Result<CharacterEvent, RecvError> {
@@ -361,7 +399,7 @@ fn frame_line(frame: &mut String, line: &str) {
     frame.push_str("\x1b[K\n");
 }
 
-impl TerminalUi {
+impl TerminalUi<'_> {
     async fn animate_character(&mut self, transformed: CharacterEvent) -> DemoResult {
         let raw = transformed
             .text
@@ -411,46 +449,7 @@ impl TerminalUi {
         Ok(())
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the complete terminal frame is easier to audit in one function"
-    )]
-    fn render(
-        &self,
-        raw: char,
-        transformed: Option<&str>,
-        active: Colorizer,
-        stage: Stage,
-    ) -> io::Result<()> {
-        let marker = match stage {
-            Stage::Moving(position) => Some((
-                position,
-                if position < PITSTOP_POSITION {
-                    Colorizer::Pass
-                } else {
-                    active
-                },
-            )),
-            Stage::Delivered => None,
-        };
-        let raw = visible(&raw.to_string());
-        let transformed_text = transformed.map_or_else(|| "waiting".into(), visible);
-        let transform_status = match active {
-            Colorizer::Pass => "PASS · as-is + one-hot count",
-            Colorizer::Red => "RED · r! + one-hot count",
-            Colorizer::Green => "GREEN · g! + one-hot count",
-            Colorizer::Blue => "BLUE · b! + one-hot count",
-        };
-
-        let mut frame = String::from("\x1b[H");
-        frame_line(&mut frame, "\x1b[1;96mHIWAY\x1b[0m  live typed events");
-        frame_line(
-            &mut frame,
-            "one Tokio broadcast bus · three async participants · central 6 ms tick",
-        );
-        frame_line(&mut frame, &"─".repeat(PIPE_WIDTH));
-        frame_line(&mut frame, "");
-
+    fn render_endpoints(&self, frame: &mut String, raw: &str) {
         let producer_box = [
             box_top("CHARACTER PRODUCER", PRODUCER_BOX_INNER_WIDTH),
             box_row("  publishes CharacterEvent", PRODUCER_BOX_INNER_WIDTH),
@@ -483,11 +482,46 @@ impl TerminalUi {
         ];
 
         for (producer, terminal) in producer_box.iter().zip(&terminal_box) {
-            frame_line(
-                &mut frame,
-                &side_by_side(producer, TERMINAL_BOX_X, terminal),
-            );
+            frame_line(frame, &side_by_side(producer, TERMINAL_BOX_X, terminal));
         }
+    }
+
+    fn render(
+        &self,
+        raw: char,
+        transformed: Option<&str>,
+        active: Colorizer,
+        stage: Stage,
+    ) -> io::Result<()> {
+        let marker = match stage {
+            Stage::Moving(position) => Some((
+                position,
+                if position < PITSTOP_POSITION {
+                    Colorizer::Pass
+                } else {
+                    active
+                },
+            )),
+            Stage::Delivered => None,
+        };
+        let raw = visible(&raw.to_string());
+        let transformed_text = transformed.map_or_else(|| "waiting".into(), visible);
+        let transform_status = match active {
+            Colorizer::Pass => "PASS · as-is + one-hot count",
+            Colorizer::Red => "RED · r! + one-hot count",
+            Colorizer::Green => "GREEN · g! + one-hot count",
+            Colorizer::Blue => "BLUE · b! + one-hot count",
+        };
+
+        let mut frame = String::from("\x1b[H");
+        frame_line(&mut frame, "\x1b[1;96mHIWAY\x1b[0m  live typed events");
+        frame_line(
+            &mut frame,
+            "one bounded event bus · Tokio drives four borrowed futures · central 6 ms tick",
+        );
+        frame_line(&mut frame, &"─".repeat(PIPE_WIDTH));
+        frame_line(&mut frame, "");
+        self.render_endpoints(&mut frame, &raw);
 
         let transform_label = format!("TRANSFORM: {transform_status}");
         frame_line(
@@ -543,7 +577,7 @@ impl TerminalUi {
     }
 }
 
-async fn run_ticker(bus: Bus<Events>) -> DemoResult {
+async fn run_ticker(bus: &DemoBus) -> DemoResult {
     let mut ticker = interval(TICK_INTERVAL);
     loop {
         ticker.tick().await;
@@ -552,24 +586,19 @@ async fn run_ticker(bus: Bus<Events>) -> DemoResult {
 }
 
 async fn run_demo() -> DemoResult {
-    let bus = Bus::new();
-    let epoch = Instant::now();
-
-    bus.transform(move |mut event: CharacterEvent| {
-        let color = Colorizer::at(epoch.elapsed());
-        event.text = color.apply(&event.text);
-        vec![event.into(), RgbaCountEvent::from_colorizer(color).into()]
+    let bus = Bus::with_pipeline(ColorPipeline {
+        epoch: Instant::now(),
     });
 
     let producer = CharacterProducer::new(&bus);
-    let count_keeper = CountKeeper::new(&bus);
-    let terminal_ui = TerminalUi::new(&bus);
+    let count_keeper = CountKeeper::new(&bus)?;
+    let terminal_ui = TerminalUi::new(&bus)?;
 
     tokio::try_join!(
         producer.run(),
         count_keeper.run(),
         terminal_ui.run(),
-        run_ticker(bus),
+        run_ticker(&bus),
     )?;
     Ok(())
 }
@@ -598,6 +627,38 @@ async fn main() -> DemoResult {
 mod tests {
     use super::*;
 
+    struct TestPipeline;
+
+    impl Pipeline<Events, 4> for TestPipeline {
+        fn apply<'a>(
+            &'a self,
+            event: Events,
+        ) -> impl std::future::Future<Output = Result<Batch<Events, 4>, OutputFull>> + Send + 'a
+        where
+            Events: 'a,
+        {
+            ensure_send(async move {
+                match event {
+                    Events::Character(mut character) => {
+                        let color = match character.text.as_str() {
+                            "P" => Colorizer::Pass,
+                            "R" => Colorizer::Red,
+                            "G" => Colorizer::Green,
+                            "B" => Colorizer::Blue,
+                            other => panic!("unexpected test character: {other}"),
+                        };
+                        character.text = color.apply(&character.text);
+                        Batch::try_from_iter([
+                            character.into(),
+                            RgbaCountEvent::from_colorizer(color).into(),
+                        ])
+                    }
+                    other => Batch::try_from_iter([other]),
+                }
+            })
+        }
+    }
+
     #[test]
     fn colorizer_cycle_and_payload_contract() {
         let states = [
@@ -618,21 +679,9 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_transform_preserves_characters_and_emits_one_hot_counts() {
-        let bus = Bus::new();
-        bus.transform(|mut event: CharacterEvent| {
-            let color = match event.text.as_str() {
-                "P" => Colorizer::Pass,
-                "R" => Colorizer::Red,
-                "G" => Colorizer::Green,
-                "B" => Colorizer::Blue,
-                other => panic!("unexpected test character: {other}"),
-            };
-            event.text = color.apply(&event.text);
-            vec![event.into(), RgbaCountEvent::from_colorizer(color).into()]
-        });
-
-        let mut characters = bus.consume::<CharacterEvent>();
-        let mut counts = bus.consume::<RgbaCountEvent>();
+        let bus: Bus<Events, 4, 8, 4, 4, TestPipeline> = Bus::with_pipeline(TestPipeline);
+        let mut characters = bus.consume::<CharacterEvent>().unwrap();
+        let mut counts = bus.consume::<RgbaCountEvent>().unwrap();
         let cases = [
             ("P", "P", Colorizer::Pass),
             ("R", "r!R", Colorizer::Red),
@@ -641,7 +690,9 @@ mod tests {
         ];
 
         for (input, expected_text, color) in cases {
-            bus.publish(CharacterEvent { text: input.into() }).await;
+            bus.publish(CharacterEvent { text: input.into() })
+                .await
+                .unwrap();
             assert!(bus.tick());
 
             assert_eq!(characters.recv().await.unwrap().text, expected_text);
@@ -654,57 +705,59 @@ mod tests {
 
     #[tokio::test]
     async fn count_keeper_owns_totals_and_publishes_ui_updates() {
-        let bus = Bus::new();
-        let mut keeper = CountKeeper::new(&bus);
-        let mut updates = bus.consume::<UiCountUpdateEvent>();
+        let bus = Bus::with_pipeline(ColorPipeline {
+            epoch: Instant::now(),
+        });
+        let mut keeper = CountKeeper::new(&bus).unwrap();
+        let mut updates = bus.consume::<UiCountUpdateEvent>().unwrap();
 
-        for color in [
-            Colorizer::Pass,
-            Colorizer::Red,
-            Colorizer::Green,
-            Colorizer::Blue,
-        ] {
-            bus.publish(RgbaCountEvent::from_colorizer(color)).await;
+        let cases = [
+            (
+                Colorizer::Pass,
+                UiCountUpdateEvent {
+                    none: 1,
+                    red: 0,
+                    green: 0,
+                    blue: 0,
+                },
+            ),
+            (
+                Colorizer::Red,
+                UiCountUpdateEvent {
+                    none: 1,
+                    red: 1,
+                    green: 0,
+                    blue: 0,
+                },
+            ),
+            (
+                Colorizer::Green,
+                UiCountUpdateEvent {
+                    none: 1,
+                    red: 1,
+                    green: 1,
+                    blue: 0,
+                },
+            ),
+            (
+                Colorizer::Blue,
+                UiCountUpdateEvent {
+                    none: 1,
+                    red: 1,
+                    green: 1,
+                    blue: 1,
+                },
+            ),
+        ];
+
+        for (color, expected) in cases {
+            bus.publish(RgbaCountEvent::from_colorizer(color))
+                .await
+                .unwrap();
             assert!(bus.tick());
             keeper.update().await.unwrap();
             assert!(bus.tick());
+            assert_eq!(updates.recv().await.unwrap(), expected);
         }
-
-        assert_eq!(
-            updates.recv().await.unwrap(),
-            UiCountUpdateEvent {
-                none: 1,
-                red: 0,
-                green: 0,
-                blue: 0,
-            }
-        );
-        assert_eq!(
-            updates.recv().await.unwrap(),
-            UiCountUpdateEvent {
-                none: 1,
-                red: 1,
-                green: 0,
-                blue: 0,
-            }
-        );
-        assert_eq!(
-            updates.recv().await.unwrap(),
-            UiCountUpdateEvent {
-                none: 1,
-                red: 1,
-                green: 1,
-                blue: 0,
-            }
-        );
-        assert_eq!(
-            updates.recv().await.unwrap(),
-            UiCountUpdateEvent {
-                none: 1,
-                red: 1,
-                green: 1,
-                blue: 1,
-            }
-        );
     }
 }

@@ -2,21 +2,41 @@
 name = "hiway"
 version = "0.1.0"
 edition = "2021"
-description = "Typed in-process event buses with global transformations and typed handler dispatch"
+rust-version = "1.96.1"
+description = "Portable typed event buses with bounded asynchronous transforms"
 license = "MIT"
+readme = "../README.md"
+documentation = "https://docs.rs/hiway"
+keywords = ["async", "event-bus", "no-std", "embedded", "typed"]
+categories = ["asynchronous", "no-std", "embedded"]
 
 [features]
-default = ["dispatch"]
-dispatch = ["dep:dptree"]
-# Marker feature used by the adjacent example crate.
-example = []
+default = []
+std = []
+dynamic = ["std"]
 
 [dependencies]
-dptree = { version = "0.5.1", optional = true }
-hiway-macros = { path = "../hiway-macros" }
-parking_lot = "0.12"
-tokio = { version = "1", features = ["sync"] }
+critical-section = { version = "1.2", default-features = false }
+heapless = { version = "0.9", default-features = false }
+hiway-macros = { version = "=0.1.0", path = "../hiway-macros" }
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
 
 [dev-dependencies]
-loom = "0.7"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+critical-section = { version = "1.2", features = ["std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+
+[[example]]
+name = "basic"
+required-features = ["std"]
+
+[[example]]
+name = "terminal"
+required-features = ["std"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

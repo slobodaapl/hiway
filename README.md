@@ -1,234 +1,374 @@
 # hiway
 
-`hiway` is a typed in-process event bus for Rust. Publishers send ordinary payload structs. Subscribers consume either the complete event enum or one payload type. A shared transform chain may modify, drop, or expand each publication. A central tick commits every finished publication currently waiting as one frame.
+`hiway` is a bounded typed event bus for Rust. Publishers run asynchronous
+transforms and prepare routed subscriber batches. A synchronous tick moves every
+completed publication into subscriber frame queues. Subscribers then receive
+events through independent cursors.
+
+The static core supports `no_std`, performs no internal heap allocation, and
+depends on no async runtime. It returns ordinary Rust futures and never spawns
+them. User transforms, conversions, tags, clones, destructors, and wakers remain
+user code and may allocate or panic.
 
 ```text
-payload -> event enum -> transform 1 -> transform 2 -> ready publications
-                                                                |
-                                                              tick
-                                                                v
-                                                   Tokio broadcast frame
-                                                    |-> subscriber A
-                                                    |-> subscriber B
-                                                    `-> subscriber C
+event -> async pipeline -> final bounded Batch
+                              |
+                       reserve + route + clone
+                              |
+                    subscriber pending frames
+                              |
+                            tick
+                              v
+                    subscriber frame queues
 ```
 
-Subscribers are independent. They do not register with each other, know which other subscribers exist, or occupy positions in a routing graph.
+Publishing and ticking remain valid with no subscribers. The next tick still
+observes a completed nonempty publication, but a later subscriber receives no
+history.
 
-## Events
+## Event algebra
 
-Define payloads as normal Rust structs, then collect them in one newtype enum:
+Let `E` be the application event enum, `Seq<E>` an ordered sequence, and `F<X>`
+an asynchronous computation producing `X`. One built-in transform stage is:
+
+```text
+E -> F<Seq<E>>
+```
+
+The sequence defines the transform:
+
+- Empty drops the input.
+- One event preserves or replaces it.
+- Several events expand it in order.
+- Sequential stages feed each output depth-first into the remaining stages.
+
+`OUTPUTS` bounds only the final `Batch`. An intermediate stage may emit more
+than `OUTPUTS` when later stages reduce the sequence. Hiway never truncates the
+final output or returns a partial batch.
+
+Built-in `Identity`, `Stage`, and `Then` use one continuation interpreter. For
+finite stage iterators that are fully polled to normal completion, left/right
+grouping produces the same output, error, transform order, and user-effect
+order. This law does not cover cancellation, unwinding, destructor effects, or
+an arbitrary direct `Pipeline` implementation. `OutputFull` prevents bus
+publication, but it cannot undo user effects already performed before the
+excess final event.
+
+Only final output is bounded. A large intermediate iterator may consume one
+poll before yielding control, and an infinite iterator can monopolize its
+publishing task when downstream stages keep completing immediately.
+
+## Events and typed routing
+
+Define ordinary payloads, then collect them in one newtype enum:
 
 ```rust
 #[derive(Clone, Debug)]
 struct UiEvent {
-    control: String,
-}
-
-#[derive(Clone, Debug)]
-struct GameEvent {
-    action: String,
+    control: &'static str,
 }
 
 #[derive(Clone, Debug)]
 struct LogEvent {
-    source: &'static str,
-    message: String,
+    message: &'static str,
 }
 
 #[derive(Clone, Debug, hiway::HiwayEvent)]
 enum Events {
     Ui(UiEvent),
-    Game(GameEvent),
     Log(LogEvent),
 }
 ```
 
-`HiwayEvent` generates the conversions used by typed publishing, consumption, and transforms. Every enum variant must wrap exactly one payload type, and each payload type may appear only once. Represent a signal without data by wrapping a zero-sized struct.
+The derive generates `From`/`TryFrom` conversions and a hidden ordinal tag for
+each variant. Each variant must wrap exactly one unique payload type. There is
+no user-visible kind enum or kind field.
 
-There is no separate kind enum, kind field, optional-field envelope, or manual trait implementation.
+For generic enums, payload types must remain distinct for every possible
+instantiation. Use newtype payloads when two variants would otherwise share the
+same generic type.
 
-## Buses
+`subscribe()` receives the complete enum. `consume::<Payload>()` records one
+route when the subscription is created. Unrelated variants are excluded before
+subscriber storage, cloning, waking, and lag accounting.
 
-Create a standalone bus when its owner can pass clones directly to components:
+## Static transforms
+
+The default path starts with the default-capacity identity bus, then consumes
+and returns it with one new statically typed transform. Its input type selects
+one payload; other variants pass through unchanged.
 
 ```rust
 use hiway::Bus;
 
-let events = Bus::new();
+let bus = Bus::default()
+    .transform(async |mut ui: UiEvent| {
+        ui.control = "inventory";
+        [ui.into()]
+    })
+    .transform(async |ui: UiEvent| {
+        [
+            Events::Ui(ui),
+            Events::Log(LogEvent {
+                message: "opened inventory",
+            }),
+        ]
+    });
 ```
 
-Standalone buses have no name. Rust infers the event enum from later transforms, publishers, or consumers.
+`Bus::default()` fixes capacities at `4 / 8 / 4 / 4`; the first transform and
+later use infer the event enum. Each `transform` call changes the concrete bus
+type, so finish this chain before borrowing the bus for subscriptions or shared
+tasks. The operation remains allocator-free and works without `std`.
 
-`Bus::new()` retains up to 256 committed tick frames for slow subscribers. Use `Bus::with_capacity(n)` when that lag window needs an explicit size.
+Appending a transform moves the existing pipeline and inline bus state into the
+new concrete type. It does not rerun the new transform over batches already
+prepared for a later tick.
 
-Unrelated components holding the same `Hiway` instance or clone can retrieve one shared bus per event enum type:
+`stage(...).then(...)` remains useful for reusable standalone pipelines.
+`with_pipeline` installs one such pipeline or a named whole-pipeline
+implementation:
 
 ```rust
-let hiway = hiway::Hiway::new();
-let events = hiway.bus();
+use hiway::{stage, PipelineExt};
+
+let pipeline = stage(async |ui: UiEvent| [Events::Ui(ui)])
+    .then(stage(async |event: Events| [event]));
 ```
 
-The event type is inferred from how `events` is used. Repeated lookups for that type return the same bus and share its transform configuration. The first lookup determines its broadcast capacity.
+Pass that value to `Bus::with_pipeline(pipeline)`; publishing or subscribing
+then infers `Events` without a turbofish.
 
-## Publishing and consuming
+Direct `Pipeline` implementations are complete terminal pipelines. Only
+Hiway's built-in `Identity`, `Stage`, and `Then` implement `PipelineExt` and can
+use `.then(...)`.
 
-The generated conversion lets a publisher send a payload directly:
+Explicit capacity bounds remain available:
 
 ```rust
-events.publish(UiEvent {
-    control: "inventory".into(),
-}).await;
-
-assert!(events.tick());
+let bus = hiway::Bus::<Events, 8, 32, 8, 6>::new()
+    .transform(async |ui: UiEvent| [Events::Ui(ui)]);
 ```
 
-`publish().await` runs the snapshotted transform chain and queues its complete output as one publication batch. It does not broadcast. `tick()` performs no transforms and waits for nothing; it commits every publication batch already waiting as one frame and reports whether the frame contained anything. Real applications normally call it from one central update loop.
+Static transforms use no boxed futures or runtime transform list. The
+application awaits or spawns `publish()` using its executor.
 
-`subscribe` receives the complete enum:
-
-```rust
-let mut all_events = events.subscribe();
-
-match all_events.recv().await? {
-    Events::Ui(ui) => println!("ui: {}", ui.control),
-    Events::Game(game) => println!("game: {}", game.action),
-    Events::Log(log) => println!("{}: {}", log.source, log.message),
-}
-```
-
-`consume` receives one payload type and skips unrelated variants locally:
+## Publishing, ticking, and consuming
 
 ```rust
-let mut logs = events.consume::<LogEvent>();
+let mut logs = bus.consume::<LogEvent>()?;
+
+bus.publish(UiEvent {
+    control: "Inventory",
+}).await?;
+
+assert!(bus.tick());
 let log = logs.recv().await?;
 ```
 
-Skipping a variant in one typed consumer does not hide it from any other subscriber. Each subscription has its own Tokio broadcast receiver.
-
-## Global transforms
-
-Transforms belong to the bus, not to subscribers. Every publication crosses the same ordered chain once before entering the ready accumulator.
+Manual loops can receive without registering a waker:
 
 ```rust
-events.transform(|mut ui: UiEvent| {
-    ui.control.make_ascii_lowercase();
-    let log = LogEvent {
-        source: "ui",
-        message: ui.control.clone(),
-    };
-    vec![ui.into(), log.into()]
-});
+match logs.try_recv()? {
+    Some(log) => consume(log),
+    None => {}
+}
 ```
 
-The closure input selects one payload type. Other variants pass through unchanged. Its returned vector defines the complete output:
+For a nonempty transformed batch, `publish().await` atomically reserves one
+`READY` slot and snapshots active subscriber generations/routes. It then filters
+variants and performs the minimum required event clones in the publishing task,
+outside synchronization. If `N` subscribers receive an event, Hiway makes
+`N - 1` clones and moves the original into the final delivery.
 
-- `vec![]` drops the matching event.
-- One value preserves or replaces it.
-- Several values expand it in order.
+The producer commits every prepared subscriber batch in one critical section.
+That commit order defines concurrent publication order. A tag or clone panic
+releases the preparation reservation and commits nothing.
 
-Use the complete enum when one stage handles several input variants. The output type remains inferred from the bus:
+`tick()` drains only completed publications. It never waits for producers,
+runs transforms, inspects tags, or clones events. It moves pending frames,
+evicts old frames, takes wakers, then destroys evicted events and invokes wakers
+after synchronization. A preparation completing after the drain waits for the
+next tick.
+
+A subscribe/publish race linearizes at the producer snapshot: the new
+subscriber may receive or miss that publication. A subscriber created after
+`publish().await` returns always misses it.
+
+## Backpressure and retry
+
+`READY` counts completed publications plus active preparation reservations.
+`PublishError::ReadyFull` preserves the exact transformed batch:
 
 ```rust
-events.transform(|event: Events| match event {
-    Events::Ui(ui) => {
-        let log = LogEvent {
-            source: "ui",
-            message: scrub_ui(&ui),
-        };
-        vec![Events::Ui(ui), log.into()]
-    }
-    Events::Game(game) if game.action == "internal-probe" => vec![],
-    other => vec![other],
-});
+use hiway::PublishError;
+
+if let Err(PublishError::ReadyFull(full)) = bus.publish(event).await {
+    let batch = full.into_batch();
+    assert!(bus.tick());
+    bus.try_submit(batch)?;
+}
 ```
 
-Subscribers receive the returned events in vector order. The asynchronous form is `transform_async`; it follows the same contract and returns `Vec<Events>` from its future.
+`try_submit` repeats preparation only. It never reruns the transform pipeline.
+If retry still finds `READY` full, its `ReadyFull` again owns the untouched
+batch.
 
-Each stage processes every output from the previous stage. Events emitted by a stage continue through later stages only. They never restart the chain, so an emission cannot accidentally recurse through the transform that created it.
+Failures remain explicit:
 
-A transform is infallible at the bus boundary. Represent a failure as an event or deliberately drop the publication.
+- `PublishError::OutputFull`: final pipeline output exceeded `OUTPUTS`.
+- `PublishError::ReadyFull(full)`: preparation could not reserve `READY`.
+- `SubscribersFull`: no bounded subscription slot remains.
+- `RecvError::Lagged(n)`: `n` unread tick frames were overwritten.
 
-## Runtime configuration and ordering
+## Bounds and memory
 
-`transform` and `transform_async` append stages. They do not remove or reorder existing stages.
+The complete type is:
 
-Each `publish` call snapshots the current chain before awaiting a transform. A stage appended during an in-flight publication affects later snapshots, not that publication.
-
-Sequential awaited publishes enter the ready accumulator in order. Concurrent publishers run their transform chains concurrently and enter it when they finish. `hiway` does not impose a global transform lock, so one slow asynchronous transform does not block unrelated publishers or the central tick.
-
-One tick swaps out the complete ready accumulator in constant time, then commits it with one broadcast send. A publication that finishes after that swap waits for the next tick. The tick never runs user transforms, iterates publications or subscribers, or awaits work. Subscribers unpack the frame locally. Outputs from each publication remain contiguous and cannot interleave with another publication.
-
-## Concurrency safety
-
-`publish()` holds the transform registry only long enough to clone the current stages. It releases that lock before awaiting or invoking transform work. Completed publications briefly lock the ready accumulator to append one batch. `tick()` takes a non-blocking commit guard, swaps out the ready accumulator, releases the ready guard, performs one Tokio broadcast send, then releases the commit guard. This preserves frame order across concurrent tick calls without holding the ready lock during transport work. Hiway invokes no transform code and crosses no `.await` while holding these locks. Its lock order has no reverse path.
-
-The dev-only Loom suite exhaustively checks bounded schedules for transform snapshot/registration, concurrent preparation/ticking, atomic frame delivery, and independent subscriber cursors. A separate public API test runs the production Tokio and parking_lot path with one transform deliberately suspended while another publication and tick complete:
-
-```bash
-cargo test -p hiway --test loom_protocol
-cargo test -p hiway --test semantics blocked_transform_does_not_block_another_publication_or_tick
+```text
+Bus<Event, OUTPUTS, READY, FRAMES, SUBSCRIBERS, Pipeline>
 ```
 
-This covers Hiway's synchronization protocol. It relies on Tokio and parking_lot's own synchronization guarantees. A transform that never returns, an application that never ticks, or components that cyclically wait for events can still starve application work; none creates an internal Hiway lock cycle.
+- `OUTPUTS`: maximum events in the final transformed publication.
+- `READY`: completed publications plus active preparation reservations.
+- `FRAMES`: committed tick frames retained by each subscriber.
+- `SUBSCRIBERS`: simultaneous subscription slots.
 
-## dptree listeners
+The defaults are `4 / 8 / 4 / 4`. Subscriber inline event storage scales
+approximately as:
 
-The default `dispatch` feature provides a `dptree`-backed router for components that handle several payload types through one subscription:
-
-```rust
-events
-    .listen()
-    .on(|ui: UiEvent| async move {
-        println!("ui: {}", ui.control);
-    })
-    .on(|log: LogEvent| async move {
-        println!("{}: {}", log.source, log.message);
-    })
-    .run()
-    .await?;
+```text
+SUBSCRIBERS * (FRAMES + 1) * READY * OUTPUTS * size_of::<Event>()
 ```
 
-Typed `on` branches cover the common case. Advanced callers can attach raw dptree branches and dependencies for `case!`, filtering, mapping, and dependency injection. This routing is local to one listener and happens after the bus's global transforms. Independent subscribers remain the fan-out mechanism.
+At the defaults, those subscriber queues reserve capacity for about 640
+`Event` values. Zero subscribers reserve no frame storage, but `FRAMES` must
+still be positive.
 
-Disable default features when handler routing is unnecessary:
+The extra frame is each subscriber's producer-prepared pending frame. Producer
+scratch per active `publish` future contains the transformed source batch plus
+at most one delivery batch per subscriber. Concurrent publication multiplies
+that scratch by the number of active futures. Tick scratch contains at most one
+discarded frame and one waker per subscriber. Add queue metadata, alignment,
+and padding. The static core uses bounded inline storage and performs no
+internal heap allocation. Payload clones and transforms may allocate because
+their implementations belong to the application.
+
+Tick frame moves/evictions/wakes are bounded by active subscribers; the
+implementation also scans the fixed `SUBSCRIBERS` slots. Tick is not a strict
+`O(1)` operation. Inline byte movement also scales with configured capacities
+and `size_of::<Event>()`; prefer compact events or handles for large payloads.
+
+## Features and dynamic transforms
+
+Default features are empty. Embedded applications use the allocator-free
+`no_std` core and must supply the target platform's `critical-section`
+implementation:
 
 ```toml
-hiway = { version = "0.1", default-features = false }
+hiway = { version = "0.1" }
 ```
 
-## Delivery semantics
+Desktop applications should enable `std`, which gives each bus its own mutex:
 
-The transport is Tokio `broadcast`; its capacity is measured in committed tick frames. A receiver that falls behind gets `RecvError::Lagged(n)`, where `n` is the number of missed frames. The loss is reported rather than hidden.
+```toml
+hiway = { version = "0.1", features = ["std"] }
+```
 
-Prepared publication batches wait in an unbounded accumulator until ticked. This keeps the central tick non-blocking; applications must tick regularly enough to prevent unbounded growth. Committing with no active receivers is valid, and that frame is not retained. A subscriber created after `publish()` but before `tick()` receives the frame.
+The derive macro runs on the build host and does not add `std` to the target.
+Correctness of the no-`std` synchronization path depends on the platform's
+`critical-section` implementation.
+
+Runtime-injectable transforms are opt-in:
+
+```toml
+hiway = { version = "0.1", features = ["dynamic"] }
+```
+
+```rust
+let bus = hiway::DynamicBus::<Events>::new();
+
+bus.transform(|mut ui: UiEvent| async move {
+    ui.control = "inventory";
+    [Events::Ui(ui)]
+});
+```
+
+`DynamicBus` uses `std` trait objects, `Vec`, `Arc`, boxed futures, and boxed
+iterators. Transform registration publishes a new `Arc<[Stage]>` snapshot. A
+publication clones that outer `Arc` once before awaiting user work; the stage
+list lock is never held across `.await`.
+
+The distinction is deliberate: `Bus::transform(self, ...)` builds an immutable
+static type before sharing, while `DynamicBus::transform(&self, ...)` mutates a
+runtime stage registry after construction.
+
+An explicit iterator stack preserves the same depth-first, final-bound order as
+the static interpreter. A stage added during an in-flight publication affects
+later publications only. `DynamicBus::try_submit` retries a preserved batch
+without rerunning runtime stages.
+
+## Concurrency and panics
+
+Concurrent publishers run independently. Their preparation commit order is the
+publication order. A suspended transform or in-progress clone does not hold bus
+state, block tick, or prevent another producer from completing.
+
+With `std`, each bus owns one `std::sync::Mutex`. Without `std`, state access
+uses the platform `critical-section`; Loom substitutes one `loom::sync::Mutex`
+per bus. Event destruction and waker invocation occur after state
+synchronization. Receive clears a registered waker when it returns an event or
+lag result. Cancelling a pending receive may retain one waker until another
+receive, a matching delivery tick, or subscription drop.
+
+User transforms, conversions, tags, clones, destructors, and wakers may panic.
+Hiway does not convert those panics into bus errors. Transform panics occur
+before reservation. Tag/clone panics release their reservation and commit
+nothing. Destructor/waker panics occur outside synchronization, after any state
+transition that selected them.
+
+## Loom model
+
+`hiway-loom` exercises the exact public `Bus`; only its lock backend changes:
+
+```bash
+RUSTFLAGS="--cfg loom" cargo test -p hiway-loom
+```
+
+The models cover concurrent producer completion/ticks, receive registration,
+in-progress preparation, ready-capacity saturation/retry, subscriber generation
+reuse, clone/tag panic cleanup, atomic publication, destruction outside state
+synchronization, and reentrant waking. This is evidence for the modeled
+protocol. It does not prove a platform's `critical-section` implementation or
+arbitrary user transform code.
 
 ## Terminal example
 
-The adjacent example crate is inert unless its `example` feature is enabled:
+```bash
+cargo run -p hiway --example basic --features std
+cargo run -p hiway --example terminal --features std
+```
+
+The demo uses Tokio as the executable's current-thread executor. Hiway does not
+depend on Tokio. Its producer, count keeper, terminal UI, and ticker are
+independent borrowed futures connected through one bus.
+
+## Release checks
 
 ```bash
-cargo run -p hiway-example --features example --bin hiway-demo
+cargo fmt --all -- --check
+cargo test --workspace
+cargo test --workspace --all-features
+cargo check -p hiway --no-default-features
+cargo test -p hiway --no-default-features
+cargo test -p hiway --doc
+cargo test -p hiway --no-default-features --doc
+cargo run -p hiway --example basic --features std
+cargo run -p hiway --example terminal --features std
+cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic
+cargo clippy -p hiway --no-default-features --all-targets -- -D warnings -W clippy::pedantic
+RUSTFLAGS="--cfg loom" cargo clippy -p hiway-loom --all-targets -- -D warnings -W clippy::pedantic
+RUSTFLAGS="--cfg loom" cargo test -p hiway-loom
+cargo package -p hiway-macros
+cargo package -p hiway
 ```
-
-The demo draws one broadcast bus. Three independent objects attach to it; the diamond is inline middleware, not an endpoint or another bus:
-
-```text
-┌─ CHARACTER PRODUCER ──────┐              ┌─ TERMINAL UI ─────────────┐
-│ publishes CharacterEvent  │              │ billboard + live counts   │
-└─────────────┬─────────────┘              └─────────────┬─────────────┘
-              │             INLINE TRANSFORM             │
-──────────────┴──────────────────◆───────────────────────┴────────────── one Tokio broadcast bus
-                                 │
-                                 │
-                       ┌─────────┴────────────┐
-                       │ COUNT KEEPER         │
-                       │ cumulative totals    │
-                       └──────────────────────┘
-```
-
-The producer, count keeper, terminal UI, and central ticker run as independent asynchronous tasks. The producer publishes characters without knowing who consumes them. The inline transform colors each `CharacterEvent`, preserves it, and emits a one-hot `RgbaCountEvent`. It owns no cumulative state.
-
-The count keeper consumes only `RgbaCountEvent`, owns the cumulative totals, then publishes `UiCountUpdateEvent`. The terminal UI consumes transformed characters and count updates, and owns all drawing. None of these objects needs to know that either of the other objects exists.
-
-The colorizer alternates between pass-through, red, green, and blue, turning `H` into `H`, `r!H`, `g!H`, or `b!H`. `A-AS-IS` is the pass-through counter, not an alpha channel. The terminal redraws one alternate-screen frame, so the animation does not fill scrollback. Press `Ctrl-C` to stop it and restore the previous screen.
