@@ -1,7 +1,43 @@
+[package]
+name = "hiway"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96.1"
+description = "Typed event specifications and bounded local routing"
+license = "MIT"
+readme = "README.md"
+documentation = "https://docs.rs/hiway"
+keywords = ["async", "event-bus", "no-std", "embedded", "typed"]
+categories = ["asynchronous", "no-std", "embedded"]
+
 [workspace]
-members = ["hiway", "hiway-macros", "hiway-loom"]
-default-members = ["hiway"]
+members = ["hiway-macros", "hiway-loom", "hiway-tests"]
+default-members = [".", "hiway-tests"]
 resolver = "2"
+
+[features]
+default = []
+std = ["dep:arc-swap", "critical-section/std"]
+
+[dependencies]
+arc-swap = { version = "1.9", optional = true }
+critical-section = { version = "1.2", default-features = false }
+heapless = { version = "0.9", default-features = false }
+hiway-macros = { version = "=0.1.0", path = "hiway-macros" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[[bin]]
+name = "hiwayd"
+path = "src/bin/hiwayd.rs"
+required-features = ["std"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [profile.release]
 opt-level = 3

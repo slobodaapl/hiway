@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-hiway = { version = "=0.1.0", path = "../hiway", default-features = false, features = ["std"] }
+hiway = { version = "=0.1.0", path = "..", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 loom = { version = "0.7", features = ["futures"] }

@@ -3,7 +3,7 @@ name = "hiway-macros"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.96.1"
-description = "Derive macros for hiway event enums"
+description = "Attribute macros for hiway event specifications and ports"
 license = "MIT"
 readme = "../README.md"
 documentation = "https://docs.rs/hiway-macros"
@@ -17,7 +17,7 @@ proc-macro = true
 proc-macro-crate = "3.5"
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "2", features = ["derive"] }
+syn = { version = "2", features = ["full"] }
 
 [package.metadata.docs.rs]
 all-features = true
