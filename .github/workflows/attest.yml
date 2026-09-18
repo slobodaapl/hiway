@@ -1,0 +1,64 @@
+name: Attest
+
+on:
+  workflow_call:
+    inputs:
+      include-macro:
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  attest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.1 --profile minimal
+
+      - name: Build release package
+        run: |
+          cargo +1.96.1 package -p hiway --locked --no-verify
+          if [[ "${{ inputs.include-macro }}" == "true" ]]; then
+            cargo +1.96.1 package -p hiway-macros --locked --no-verify
+          fi
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: target/package/hiway.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attest release packages
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: target/package/*.crate
+
+      - name: Attest release SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: target/package/*.crate
+          sbom-path: target/package/hiway.cdx.json
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-evidence-${{ github.sha }}
+          path: |
+            target/package/*.crate
+            target/package/hiway.cdx.json
+          if-no-files-found: error
+          retention-days: 90

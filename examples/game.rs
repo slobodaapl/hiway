@@ -1,8 +1,11 @@
-//! Small std-hosted game loop with one injected event bus.
+//! A game owns its streams and grants each component only its declared operations.
 
-use hiway::{events, port, EventPort, EventReceiver, PortExt, SendError};
+use hiway::{
+    events, port, DynamicFabric, EventPort, EventReceiver, Grant, Limits, Permission, PortExt,
+    ReceiveError, Rights, StreamConfig, StreamItem,
+};
 
-type GameBus = hiway::DynamicFabric;
+type GameResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Position {
@@ -46,7 +49,7 @@ enum GameEvents {
 }
 
 #[port(
-    factory = GameBus,
+    factory = Grant,
     send(game_events::PlayerAttackRequested),
     recv(
         game_events::PlayerMoved,
@@ -62,6 +65,7 @@ struct Ui<P> {
     frame: u64,
     selected_target: u32,
     notifications: u32,
+    missed_events: u64,
     last_position: Option<Position>,
     last_spawn: Option<MonsterInfo>,
     defeated: u32,
@@ -69,9 +73,9 @@ struct Ui<P> {
 }
 
 #[port(
-    factory = GameBus,
+    factory = Grant,
     send(game_events::PlayerMoved, game_events::PlayerAttacked),
-    recv(game_events::PlayerAttackRequested)
+    required(game_events::PlayerAttackRequested)
 )]
 struct PlayerPort;
 
@@ -88,7 +92,7 @@ struct Player<P> {
 }
 
 #[port(
-    factory = GameBus,
+    factory = Grant,
     send(
         game_events::MonsterSpawned,
         game_events::MonsterDefeated,
@@ -108,7 +112,7 @@ struct World<P> {
     last_attack: Option<Attack>,
 }
 
-#[port(factory = GameBus, recv(game_events::PlayerAttacked))]
+#[port(factory = Grant, required(game_events::PlayerAttacked))]
 struct MonsterPort;
 
 struct Monster<P> {
@@ -143,21 +147,30 @@ where
         + EventPort<game_events::PlayerAttacked>
         + EventReceiver<game_events::PlayerAttackRequested>,
 {
-    async fn move_to(&mut self, position: Position) -> Result<(), SendError> {
+    async fn move_to(&mut self, position: Position) -> GameResult {
         self.position = position;
-        self.port.publish(game_events::PlayerMoved(position)).await
+        self.port
+            .publish(game_events::PlayerMoved(position))
+            .await?;
+        Ok(())
     }
 
-    async fn process_attack_request(&self) -> Result<(), SendError> {
-        let Some(request) = self.port.try_recv::<game_events::PlayerAttackRequested>() else {
-            return Ok(());
-        };
-        self.port
-            .publish(game_events::PlayerAttacked(Attack {
-                target: request.target,
-                damage: self.attack_power,
-            }))
-            .await
+    async fn process_attack_request(&self) -> GameResult {
+        match self.port.recv_now::<game_events::PlayerAttackRequested>()? {
+            Some(StreamItem::Data { value: request, .. }) => {
+                self.port
+                    .publish(game_events::PlayerAttacked(Attack {
+                        target: request.target,
+                        damage: self.attack_power,
+                    }))
+                    .await?;
+            }
+            Some(StreamItem::Gap { from, to }) => {
+                eprintln!("player missed attack requests {from}..{to}");
+            }
+            None => {}
+        }
+        Ok(())
     }
 }
 
@@ -188,16 +201,21 @@ impl<P> Monster<P>
 where
     P: EventReceiver<game_events::PlayerAttacked>,
 {
-    fn process_attack(&mut self) -> bool {
-        let Some(attack) = self.port.try_recv::<game_events::PlayerAttacked>() else {
-            return false;
+    fn process_attack(&mut self) -> Result<bool, ReceiveError> {
+        let attack = match self.port.recv_now::<game_events::PlayerAttacked>()? {
+            Some(StreamItem::Data { value, .. }) => value,
+            Some(StreamItem::Gap { from, to }) => {
+                eprintln!("monster {} missed attacks {from}..{to}", self.id);
+                return Ok(false);
+            }
+            None => return Ok(false),
         };
         if attack.target != self.id {
-            return false;
+            return Ok(false);
         }
         let damage = attack.damage.saturating_sub(self.armor);
         self.health = self.health.saturating_sub(damage);
-        self.health == 0
+        Ok(self.health == 0)
     }
 }
 
@@ -226,34 +244,48 @@ where
         + EventReceiver<game_events::PlayerMoved>
         + EventReceiver<game_events::PlayerAttacked>,
 {
-    async fn spawn<Q>(&mut self, monster: &Monster<Q>) -> Result<(), SendError> {
+    async fn spawn<Q>(&mut self, monster: &Monster<Q>) -> GameResult {
         self.active_monsters += 1;
         self.port
             .publish(game_events::MonsterSpawned(monster.info()))
-            .await
+            .await?;
+        Ok(())
     }
 
-    async fn defeat(&mut self, monster_id: u32) -> Result<(), SendError> {
+    async fn defeat(&mut self, monster_id: u32) -> GameResult {
         self.active_monsters = self.active_monsters.saturating_sub(1);
         self.port
             .publish(game_events::MonsterDefeated(monster_id))
-            .await
+            .await?;
+        Ok(())
     }
 
-    async fn set_weather(&mut self, weather: Weather) -> Result<(), SendError> {
+    async fn set_weather(&mut self, weather: Weather) -> GameResult {
         self.weather = weather;
         self.port
             .publish(game_events::WeatherChanged(weather))
-            .await
+            .await?;
+        Ok(())
     }
 
-    fn drain_player_events(&mut self) {
-        while let Some(position) = self.port.try_recv::<game_events::PlayerMoved>() {
-            self.last_player_position = Some(position);
+    fn drain_player_events(&mut self) -> Result<(), ReceiveError> {
+        while let Some(item) = self.port.recv_now::<game_events::PlayerMoved>()? {
+            match item {
+                StreamItem::Data { value, .. } => self.last_player_position = Some(*value),
+                StreamItem::Gap { from, to } => {
+                    eprintln!("world missed player movement {from}..{to}");
+                }
+            }
         }
-        while let Some(attack) = self.port.try_recv::<game_events::PlayerAttacked>() {
-            self.last_attack = Some(attack);
+        while let Some(item) = self.port.recv_now::<game_events::PlayerAttacked>()? {
+            match item {
+                StreamItem::Data { value, .. } => self.last_attack = Some(*value),
+                StreamItem::Gap { from, to } => {
+                    eprintln!("world missed attacks {from}..{to}");
+                }
+            }
         }
+        Ok(())
     }
 }
 
@@ -264,6 +296,7 @@ impl<P> Ui<P> {
             frame: 0,
             selected_target: 0,
             notifications: 0,
+            missed_events: 0,
             last_position: None,
             last_spawn: None,
             defeated: 0,
@@ -280,51 +313,137 @@ where
         + EventReceiver<game_events::MonsterDefeated>
         + EventReceiver<game_events::WeatherChanged>,
 {
-    async fn request_attack(&mut self, target: u32) -> Result<(), SendError> {
+    async fn request_attack(&mut self, target: u32) -> GameResult {
         self.selected_target = target;
         self.port
             .publish(game_events::PlayerAttackRequested(AttackRequest { target }))
-            .await
+            .await?;
+        Ok(())
     }
 
-    fn drain_events(&mut self) {
+    fn drain_events(&mut self) -> Result<(), ReceiveError> {
         self.frame += 1;
-        while let Some(position) = self.port.try_recv::<game_events::PlayerMoved>() {
-            self.notifications += 1;
-            self.last_position = Some(position);
+        while let Some(item) = self.port.recv_now::<game_events::PlayerMoved>()? {
+            match item {
+                StreamItem::Data { value, .. } => {
+                    self.notifications += 1;
+                    self.last_position = Some(*value);
+                }
+                StreamItem::Gap { from, to } => self.missed_events += to - from,
+            }
         }
-        while let Some(info) = self.port.try_recv::<game_events::MonsterSpawned>() {
-            self.notifications += 1;
-            self.last_spawn = Some(info);
+        while let Some(item) = self.port.recv_now::<game_events::MonsterSpawned>()? {
+            match item {
+                StreamItem::Data { value, .. } => {
+                    self.notifications += 1;
+                    self.last_spawn = Some(*value);
+                }
+                StreamItem::Gap { from, to } => self.missed_events += to - from,
+            }
         }
-        while self
-            .port
-            .try_recv::<game_events::MonsterDefeated>()
-            .is_some()
-        {
-            self.notifications += 1;
-            self.defeated += 1;
+        while let Some(item) = self.port.recv_now::<game_events::MonsterDefeated>()? {
+            match item {
+                StreamItem::Data { .. } => {
+                    self.notifications += 1;
+                    self.defeated += 1;
+                }
+                StreamItem::Gap { from, to } => self.missed_events += to - from,
+            }
         }
-        while let Some(weather) = self.port.try_recv::<game_events::WeatherChanged>() {
-            self.notifications += 1;
-            self.weather = Some(weather);
+        while let Some(item) = self.port.recv_now::<game_events::WeatherChanged>()? {
+            match item {
+                StreamItem::Data { value, .. } => {
+                    self.notifications += 1;
+                    self.weather = Some(*value);
+                }
+                StreamItem::Gap { from, to } => self.missed_events += to - from,
+            }
         }
+        Ok(())
     }
 }
 
+fn game_fabric() -> GameResult<DynamicFabric> {
+    let game_bus = DynamicFabric::new();
+    let stream = StreamConfig::default();
+    game_bus.create_stream::<game_events::PlayerMoved>(stream)?;
+    game_bus.create_stream::<game_events::PlayerAttackRequested>(stream)?;
+    game_bus.create_stream::<game_events::PlayerAttacked>(stream)?;
+    game_bus.create_stream::<game_events::MonsterSpawned>(stream)?;
+    game_bus.create_stream::<game_events::MonsterDefeated>(stream)?;
+    game_bus.create_stream::<game_events::WeatherChanged>(stream)?;
+    Ok(game_bus)
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let game_bus = GameBus::new();
-    let mut ui = Ui::new(UiPort::bind(&game_bus)?);
-    let mut player = Player::new(PlayerPort::bind(&game_bus)?);
-    let mut world = World::new(WorldPort::bind(&game_bus)?);
-    let mut monster = Monster::new(MonsterPort::bind(&game_bus)?);
+async fn main() -> GameResult {
+    let game_bus = game_fabric()?;
+    let publish = hiway::StreamLimits {
+        retained_items: 8,
+        subscriptions: 0,
+        waiters: 1,
+    };
+    let observe = hiway::StreamLimits {
+        retained_items: 0,
+        subscriptions: 1,
+        waiters: 1,
+    };
+    let component_limits = Limits {
+        streams: 6,
+        subscriptions: 4,
+        retained_items: 32,
+        waiters: 6,
+        ..Limits::ZERO
+    };
+    let ui_grant = game_bus.grant(
+        &[
+            Permission::new::<game_events::PlayerAttackRequested>(Rights::PUBLISH)
+                .with_limits(publish),
+            Permission::new::<game_events::PlayerMoved>(Rights::OBSERVE).with_limits(observe),
+            Permission::new::<game_events::MonsterSpawned>(Rights::OBSERVE).with_limits(observe),
+            Permission::new::<game_events::MonsterDefeated>(Rights::OBSERVE).with_limits(observe),
+            Permission::new::<game_events::WeatherChanged>(Rights::OBSERVE).with_limits(observe),
+        ],
+        component_limits,
+    )?;
+    let player_grant = game_bus.grant(
+        &[
+            Permission::new::<game_events::PlayerMoved>(Rights::PUBLISH).with_limits(publish),
+            Permission::new::<game_events::PlayerAttacked>(Rights::PUBLISH).with_limits(publish),
+            Permission::new::<game_events::PlayerAttackRequested>(
+                Rights::OBSERVE | Rights::REQUIRED,
+            )
+            .with_limits(observe),
+        ],
+        component_limits,
+    )?;
+    let world_grant = game_bus.grant(
+        &[
+            Permission::new::<game_events::MonsterSpawned>(Rights::PUBLISH).with_limits(publish),
+            Permission::new::<game_events::MonsterDefeated>(Rights::PUBLISH).with_limits(publish),
+            Permission::new::<game_events::WeatherChanged>(Rights::PUBLISH).with_limits(publish),
+            Permission::new::<game_events::PlayerMoved>(Rights::OBSERVE).with_limits(observe),
+            Permission::new::<game_events::PlayerAttacked>(Rights::OBSERVE).with_limits(observe),
+        ],
+        component_limits,
+    )?;
+    let monster_grant = game_bus.grant(
+        &[
+            Permission::new::<game_events::PlayerAttacked>(Rights::OBSERVE | Rights::REQUIRED)
+                .with_limits(observe),
+        ],
+        component_limits,
+    )?;
+    let mut ui = Ui::new(UiPort::bind(&ui_grant)?);
+    let mut player = Player::new(PlayerPort::bind(&player_grant)?);
+    let mut world = World::new(WorldPort::bind(&world_grant)?);
+    let mut monster = Monster::new(MonsterPort::bind(&monster_grant)?);
 
     player.move_to(Position { x: 5, y: 2 }).await?;
     world.spawn(&monster).await?;
     ui.request_attack(monster.id).await?;
     player.process_attack_request().await?;
-    if monster.process_attack() {
+    if monster.process_attack()? {
         world.defeat(monster.id).await?;
     }
     world
@@ -334,11 +453,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
-    ui.drain_events();
-    world.drain_player_events();
+    ui.drain_events()?;
+    world.drain_player_events()?;
 
     println!(
-        "{} (lvl {}, {}/{} HP, {} mana, {} armor) defeated {} (lvl {}, {}/{} HP); world difficulty {}, tick {}, {}°C {}; UI frame {}, {} notifications",
+        "{} (lvl {}, {}/{} HP, {} mana, {} armor) defeated {} (lvl {}, {}/{} HP); world difficulty {}, tick {}, {}°C {}; UI frame {}, {} notifications, {} missed events",
         player.name,
         player.level,
         player.health,
@@ -355,6 +474,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         world.weather.name,
         ui.frame,
         ui.notifications,
+        ui.missed_events,
     );
     Ok(())
 }

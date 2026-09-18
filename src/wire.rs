@@ -1,3 +1,5 @@
+use core::fmt;
+
 use crate::{EventId, EventMetadata, EventSpec, OriginId, SchemaRevision, WireEnvelope, WireMajor};
 
 /// Fixed byte length of an encoded envelope header.
@@ -5,6 +7,7 @@ pub const ENVELOPE_HEADER_BYTES: usize = 70;
 
 /// Failure while encoding or decoding one event payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WireError {
     /// The caller-provided output buffer is too small.
     BufferTooSmall,
@@ -17,6 +20,21 @@ pub enum WireError {
     /// A header contains a value outside the protocol's valid range.
     InvalidHeader,
 }
+
+impl fmt::Display for WireError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::BufferTooSmall => "output buffer is too small",
+            Self::InvalidPayload => "payload is invalid",
+            Self::UnsupportedRevision => "schema revision is unsupported",
+            Self::Truncated => "wire envelope is truncated",
+            Self::InvalidHeader => "wire envelope header is invalid",
+        })
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for WireError {}
 
 /// Fixed-size header preceding one encoded payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +53,10 @@ pub struct EnvelopeHeader {
 
 impl EnvelopeHeader {
     /// Builds a header directly from an event contract and encoded length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError::InvalidHeader`] if `payload_len` exceeds [`u32::MAX`].
     pub fn for_event<S: EventSpec>(
         metadata: crate::EventMetadata,
         payload_len: usize,
@@ -50,6 +72,10 @@ impl EnvelopeHeader {
     }
 
     /// Builds a header from a borrowed envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError::InvalidHeader`] if the payload length exceeds [`u32::MAX`].
     pub fn from_envelope(envelope: &WireEnvelope<'_>) -> Result<Self, WireError> {
         let payload_len =
             u32::try_from(envelope.payload.len()).map_err(|_| WireError::InvalidHeader)?;
@@ -63,6 +89,12 @@ impl EnvelopeHeader {
     }
 
     /// Encodes this header into a fixed-size caller buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError::BufferTooSmall`] if `output` is shorter than
+    /// [`ENVELOPE_HEADER_BYTES`], or [`WireError::InvalidHeader`] if a present
+    /// TTL or fabric sequence uses the maximum integer value reserved for absence.
     pub fn encode(self, output: &mut [u8]) -> Result<(), WireError> {
         if output.len() < ENVELOPE_HEADER_BYTES {
             return Err(WireError::BufferTooSmall);
@@ -105,6 +137,11 @@ impl EnvelopeHeader {
     }
 
     /// Decodes a header without allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError::Truncated`] if `input` is shorter than
+    /// [`ENVELOPE_HEADER_BYTES`].
     pub fn decode(input: &[u8]) -> Result<Self, WireError> {
         if input.len() < ENVELOPE_HEADER_BYTES {
             return Err(WireError::Truncated);
@@ -158,8 +195,20 @@ pub trait WireCodec: EventSpec {
     fn encoded_len(payload: &Self::Payload) -> usize;
 
     /// Encodes one payload into the caller-provided buffer.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return [`WireError::BufferTooSmall`] if `output` cannot
+    /// hold the encoding, or [`WireError::InvalidPayload`] if the payload
+    /// cannot be represented by the event schema.
     fn encode(payload: &Self::Payload, output: &mut [u8]) -> Result<usize, WireError>;
 
     /// Decodes one payload from a compatible schema revision.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return [`WireError::UnsupportedRevision`] if `revision`
+    /// is unsupported, or [`WireError::InvalidPayload`] if `bytes` do not encode
+    /// a valid payload for that revision.
     fn decode(bytes: &[u8], revision: SchemaRevision) -> Result<Self::Payload, WireError>;
 }

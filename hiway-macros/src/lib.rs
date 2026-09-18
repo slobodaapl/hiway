@@ -75,6 +75,18 @@ impl Parse for EventsArgs {
     }
 }
 
+impl EventsArgs {
+    fn wire_constants(&self, hiway: &TokenStream2) -> TokenStream2 {
+        let wire_major = self.wire_major.as_ref().map(
+            |literal| quote!(const WIRE_MAJOR: #hiway::WireMajor = #hiway::WireMajor(#literal);),
+        );
+        let schema_revision = self.schema_revision.as_ref().map(|literal| {
+            quote!(const SCHEMA_REVISION: #hiway::SchemaRevision = #hiway::SchemaRevision(#literal);)
+        });
+        quote!(#wire_major #schema_revision)
+    }
+}
+
 fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2> {
     if !item.generics.params.is_empty() {
         return Err(Error::new_spanned(
@@ -87,18 +99,7 @@ fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2
     let visibility = &item.vis;
     let enum_name = &item.ident;
     let module = format_ident!("{}", snake_case(&enum_name.to_string()));
-    let wire_constants = match (&arguments.wire_major, &arguments.schema_revision) {
-        (None, None) => quote!(),
-        (wire_major, schema_revision) => {
-            let wire_major = wire_major.as_ref().map(
-                |literal| quote!(const WIRE_MAJOR: #hiway::WireMajor = #hiway::WireMajor(#literal);),
-            );
-            let schema_revision = schema_revision.as_ref().map(|literal| {
-                quote!(const SCHEMA_REVISION: #hiway::SchemaRevision = #hiway::SchemaRevision(#literal);)
-            });
-            quote!(#wire_major #schema_revision)
-        }
-    };
+    let wire_constants = arguments.wire_constants(&hiway);
     let marker_visibility = if matches!(visibility, syn::Visibility::Inherited) {
         quote!(pub(crate))
     } else {
@@ -153,15 +154,7 @@ fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2
 
             #constructor
         });
-        let event_id = quote! {
-            #hiway::EventId::from_name(concat!(
-                module_path!(),
-                "::",
-                stringify!(#enum_name),
-                "::",
-                stringify!(#name),
-            ))
-        };
+        let event_id = event_identity(&hiway, enum_name, name);
         implementations.push(quote! {
             impl #hiway::EventSpec for #module::#name {
                 type Payload = #payload;
@@ -202,11 +195,23 @@ fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2
     })
 }
 
+fn event_identity(hiway: &TokenStream2, enum_name: &Ident, variant: &Ident) -> TokenStream2 {
+    quote! {
+        #hiway::EventId::from_name(concat!(
+            module_path!(),
+            "::",
+            stringify!(#enum_name),
+            "::",
+            stringify!(#variant),
+        ))
+    }
+}
+
 struct PortArgs {
     factory: Path,
     send: Vec<Path>,
     recv: Vec<Path>,
-    capacity: Option<LitInt>,
+    required: Vec<Path>,
 }
 
 impl Parse for PortArgs {
@@ -214,7 +219,7 @@ impl Parse for PortArgs {
         let mut factory = None;
         let mut send = None;
         let mut recv = None;
-        let mut capacity = None;
+        let mut required = None;
         while !input.is_empty() {
             let key: SynIdent = input.parse()?;
             match key.to_string().as_str() {
@@ -223,7 +228,7 @@ impl Parse for PortArgs {
                     factory = Some(input.parse()?);
                 }
                 "factory" => return Err(Error::new(key.span(), "port factory repeated")),
-                "send" | "recv" => {
+                "send" | "recv" | "required" => {
                     let content;
                     parenthesized!(content in input);
                     let paths = content
@@ -233,22 +238,19 @@ impl Parse for PortArgs {
                     match key.to_string().as_str() {
                         "send" if send.is_none() => send = Some(paths),
                         "recv" if recv.is_none() => recv = Some(paths),
+                        "required" if required.is_none() => required = Some(paths),
                         _ => {
                             return Err(Error::new(key.span(), "port capability group repeated"));
                         }
                     }
                 }
-                "capacity" if capacity.is_none() => {
-                    input.parse::<Token![=]>()?;
-                    capacity = Some(input.parse()?);
-                }
                 "capacity" => {
-                    return Err(Error::new(key.span(), "port capacity repeated"));
+                    return Err(Error::new(key.span(), "stream capacity belongs to owner"));
                 }
                 _ => {
                     return Err(Error::new(
                         key.span(),
-                        "expected `factory = Type`, `send(...)`, `recv(...)`, or `capacity = N`",
+                        "expected `factory = Type`, `send(...)`, `recv(...)`, or `required(...)`",
                     ));
                 }
             }
@@ -260,7 +262,7 @@ impl Parse for PortArgs {
             factory: factory.ok_or_else(|| input.error("port requires `factory = Type`"))?,
             send: send.unwrap_or_default(),
             recv: recv.unwrap_or_default(),
-            capacity,
+            required: required.unwrap_or_default(),
         })
     }
 }
@@ -305,7 +307,7 @@ impl Parse for GraphArgs {
     }
 }
 
-fn expand_graph(arguments: &GraphArgs, item: &ItemStruct) -> Result<TokenStream2> {
+fn validate_graph(arguments: &GraphArgs, item: &ItemStruct) -> Result<()> {
     if !item.generics.params.is_empty() {
         return Err(Error::new_spanned(
             &item.generics,
@@ -330,17 +332,29 @@ fn expand_graph(arguments: &GraphArgs, item: &ItemStruct) -> Result<TokenStream2
             return Err(Error::new_spanned(&entry.event, "graph event repeated"));
         }
     }
+    Ok(())
+}
 
+fn expand_graph(arguments: &GraphArgs, item: &ItemStruct) -> Result<TokenStream2> {
+    validate_graph(arguments, item)?;
     let hiway = hiway_path()?;
     let graph = &item.ident;
     let visibility = &item.vis;
     let attrs = &item.attrs;
+    let payload_bounds = arguments
+        .entries
+        .iter()
+        .map(|entry| {
+            let event = &entry.event;
+            quote!(<#event as #hiway::EventSpec>::Payload: ::core::marker::Copy)
+        })
+        .collect::<Vec<_>>();
     let fields_definitions = arguments.entries.iter().map(|entry| {
         let field = &entry.field;
         let event = &entry.event;
         let capacity = &entry.capacity;
         quote! {
-            #field: #hiway::StaticFabric<'route, 'target, #event, #capacity>
+            #field: #hiway::StaticFabric<'route, #event, #capacity, 8, 16>
         }
     });
     let constructor_parameters = arguments.entries.iter().map(|entry| {
@@ -348,80 +362,31 @@ fn expand_graph(arguments: &GraphArgs, item: &ItemStruct) -> Result<TokenStream2
         let event = &entry.event;
         let capacity = &entry.capacity;
         quote! {
-            #field: &'route #hiway::HeaplessRoute<'target, #event, #capacity>
+            #field: &'route #hiway::StaticStream<#event, #capacity, 8, 16>
         }
     });
     let constructor_fields = arguments.entries.iter().map(|entry| {
         let field = &entry.field;
         quote! { #field: #hiway::StaticFabric::new(#field) }
     });
-    let binding_impls = arguments.entries.iter().map(|entry| {
-        let field = &entry.field;
-        let event = &entry.event;
-        let capacity = &entry.capacity;
-        quote! {
-            impl<'route, 'target> #hiway::PortBinding<'target, #event>
-                for #graph<'route, 'target>
-            where
-                <#event as #hiway::EventSpec>::Payload: Clone,
-            {
-                type Sender = <#hiway::StaticFabric<
-                    'route,
-                    'target,
-                    #event,
-                    #capacity,
-                > as #hiway::PortBinding<'target, #event>>::Sender;
-                type Subscription = <#hiway::StaticFabric<
-                    'route,
-                    'target,
-                    #event,
-                    #capacity,
-                > as #hiway::PortBinding<'target, #event>>::Subscription;
-
-                fn sender(&self) -> ::core::result::Result<Self::Sender, #hiway::TopicError> {
-                    <#hiway::StaticFabric<
-                        'route,
-                        'target,
-                        #event,
-                        #capacity,
-                    > as #hiway::PortBinding<'target, #event>>::sender(&self.#field)
-                }
-
-                fn subscribe_mapped<T, H>(
-                    &self,
-                    target: &'target #hiway::MappedTarget<
-                        <#event as #hiway::EventSpec>::Payload,
-                        T,
-                        H,
-                    >,
-                    policy: #hiway::DeliveryPolicy,
-                ) -> ::core::result::Result<Self::Subscription, #hiway::TopicError>
-                where
-                    T: 'target,
-                    H: #hiway::Target<T> + Clone + Sync + 'target,
-                {
-                    <#hiway::StaticFabric<
-                        'route,
-                        'target,
-                        #event,
-                        #capacity,
-                    > as #hiway::PortBinding<'target, #event>>::subscribe_mapped(
-                        &self.#field,
-                        target,
-                        policy,
-                    )
-                }
-            }
-        }
-    });
+    let binding_impls = arguments
+        .entries
+        .iter()
+        .map(|entry| graph_binding(&hiway, graph, entry, &payload_bounds));
 
     Ok(quote! {
         #(#attrs)*
-        #visibility struct #graph<'route, 'target> {
+        #visibility struct #graph<'route>
+        where
+            #(#payload_bounds,)*
+        {
             #(#fields_definitions,)*
         }
 
-        impl<'route, 'target> #graph<'route, 'target> {
+        impl<'route> #graph<'route>
+        where
+            #(#payload_bounds,)*
+        {
             #[must_use]
             pub const fn new(
                 #(#constructor_parameters,)*
@@ -432,14 +397,28 @@ fn expand_graph(arguments: &GraphArgs, item: &ItemStruct) -> Result<TokenStream2
             }
 
             pub fn sender<S>(&self) -> ::core::result::Result<
-                <Self as #hiway::PortBinding<'target, S>>::Sender,
+                <Self as #hiway::PortBinding<'route, S>>::Sender,
                 #hiway::TopicError,
             >
             where
                 S: #hiway::EventSpec,
-                Self: #hiway::PortBinding<'target, S>,
+                Self: #hiway::PortBinding<'route, S>,
             {
-                <Self as #hiway::PortBinding<'target, S>>::sender(self)
+                <Self as #hiway::PortBinding<'route, S>>::sender(self)
+            }
+
+            pub fn subscribe<S>(
+                &self,
+                role: #hiway::SubscriptionRole,
+            ) -> ::core::result::Result<
+                <Self as #hiway::PortBinding<'route, S>>::Receiver,
+                #hiway::TopicError,
+            >
+            where
+                S: #hiway::EventSpec,
+                Self: #hiway::PortBinding<'route, S>,
+            {
+                <Self as #hiway::PortBinding<'route, S>>::subscribe(self, role)
             }
         }
 
@@ -447,7 +426,41 @@ fn expand_graph(arguments: &GraphArgs, item: &ItemStruct) -> Result<TokenStream2
     })
 }
 
-#[allow(clippy::too_many_lines)]
+fn graph_binding(
+    hiway: &TokenStream2,
+    graph: &Ident,
+    entry: &GraphEntry,
+    payload_bounds: &[TokenStream2],
+) -> TokenStream2 {
+    let field = &entry.field;
+    let event = &entry.event;
+    let capacity = &entry.capacity;
+    let binding = quote!(
+        <#hiway::StaticFabric<'route, #event, #capacity, 8, 16>
+            as #hiway::PortBinding<'route, #event>>
+    );
+    quote! {
+        impl<'route> #hiway::PortBinding<'route, #event> for #graph<'route>
+        where
+            #(#payload_bounds,)*
+        {
+            type Sender = #binding::Sender;
+            type Receiver = #binding::Receiver;
+
+            fn sender(&self) -> ::core::result::Result<Self::Sender, #hiway::TopicError> {
+                #binding::sender(&self.#field)
+            }
+
+            fn subscribe(
+                &self,
+                role: #hiway::SubscriptionRole,
+            ) -> ::core::result::Result<Self::Receiver, #hiway::TopicError> {
+                #binding::subscribe(&self.#field, role)
+            }
+        }
+    }
+}
+
 fn expand_port(arguments: &PortArgs, item: &ItemStruct) -> Result<TokenStream2> {
     if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
         return Err(Error::new_spanned(
@@ -462,17 +475,15 @@ fn expand_port(arguments: &PortArgs, item: &ItemStruct) -> Result<TokenStream2> 
         ));
     }
 
-    let hiway = hiway_path()?;
     let factory = &arguments.factory;
     let port = &item.ident;
     let visibility = &item.vis;
     let attrs = &item.attrs;
-    let capacity = arguments.capacity.as_ref().map_or_else(
-        || quote!(#hiway::DEFAULT_INBOX_CAPACITY),
-        |literal| quote!(#literal),
-    );
     let send = capability_list(&arguments.send, "send")?;
-    let recv = capability_list(&arguments.recv, "recv")?;
+    let mut receive_paths = arguments.recv.clone();
+    receive_paths.extend(arguments.required.iter().cloned());
+    let recv = capability_list(&receive_paths, "receive")?;
+    let hiway = hiway_path()?;
 
     let sender_fields = send.iter().map(|(event, _, field)| {
         let field = format_ident!("__send_{field}");
@@ -486,13 +497,58 @@ fn expand_port(arguments: &PortArgs, item: &ItemStruct) -> Result<TokenStream2> 
     });
     let receiver_fields = recv.iter().map(|(event, _, field)| {
         let field = format_ident!("__recv_{field}");
-        quote!(#field: #hiway::OwnedEndpoint<#factory, #event, { #capacity }>)
+        quote!(#field: <#factory as #hiway::OwnedPortBinding<#event>>::Receiver)
     });
-    let receiver_initializers = recv.iter().map(|(_, _, field)| {
+    let receiver_initializers = recv.iter().enumerate().map(|(index, (event, _, field))| {
         let field = format_ident!("__recv_{field}");
-        quote!(#field: #hiway::OwnedEndpoint::bind(factory)?)
+        let role = if index < arguments.recv.len() {
+            quote!(#hiway::SubscriptionRole::Observer)
+        } else {
+            quote!(#hiway::SubscriptionRole::Required)
+        };
+        quote!(#field: <#factory as #hiway::OwnedPortBinding<#event>>::subscribe_owned(
+            factory,
+            #role,
+        )?)
     });
 
+    let event_impls = port_event_impls(&hiway, factory, port, &send, &recv);
+    let named_methods = named_port_methods(&hiway, &send, &recv);
+    let generic_methods = generic_port_methods(&hiway);
+
+    Ok(quote! {
+        #(#attrs)*
+        #visibility struct #port {
+            #(#sender_fields,)*
+            #(#receiver_fields,)*
+        }
+
+        impl #port {
+            pub fn bind(
+                factory: &#factory,
+            ) -> ::core::result::Result<Self, #hiway::PortError> {
+                ::core::result::Result::Ok(Self {
+                    #(#sender_initializers,)*
+                    #(#receiver_initializers,)*
+                })
+            }
+
+            #generic_methods
+
+            #named_methods
+        }
+
+        #event_impls
+    })
+}
+
+fn port_event_impls(
+    hiway: &TokenStream2,
+    factory: &Path,
+    port: &Ident,
+    send: &[(Path, Ident, Ident)],
+    recv: &[(Path, Ident, Ident)],
+) -> TokenStream2 {
     let port_impl = quote!(impl #hiway::Port for #port {});
     let publication_impls = send.iter().map(|(event, _, field)| {
         let sender_field = format_ident!("__send_{field}");
@@ -510,51 +566,77 @@ fn expand_port(arguments: &PortArgs, item: &ItemStruct) -> Result<TokenStream2> 
         let receiver_field = format_ident!("__recv_{field}");
         quote! {
             impl #hiway::EventReceiver<#event> for #port {
-                fn event_try_recv(&self) -> ::core::option::Option<
-                    <#event as #hiway::EventSpec>::Payload,
+                type Value = <<#factory as #hiway::OwnedPortBinding<#event>>::Receiver
+                    as #hiway::EventReceiver<#event>>::Value;
+
+                fn event_try_recv(&self) -> ::core::result::Result<
+                    ::core::option::Option<#hiway::StreamItem<Self::Value>>,
+                    #hiway::ReceiveError,
                 > {
-                    self.#receiver_field.try_recv()
+                    <<#factory as #hiway::OwnedPortBinding<#event>>::Receiver
+                        as #hiway::EventReceiver<#event>>::event_try_recv(&self.#receiver_field)
+                }
+
+                fn event_recv_now(&self) -> ::core::result::Result<
+                    ::core::option::Option<#hiway::StreamItem<Self::Value>>,
+                    #hiway::ReceiveError,
+                > {
+                    <<#factory as #hiway::OwnedPortBinding<#event>>::Receiver
+                        as #hiway::EventReceiver<#event>>::event_recv_now(&self.#receiver_field)
                 }
 
                 fn event_recv(
                     &self,
                 ) -> impl ::core::future::Future<
-                    Output = ::core::option::Option<
-                        <#event as #hiway::EventSpec>::Payload,
+                    Output = ::core::result::Result<
+                        #hiway::StreamItem<Self::Value>,
+                        #hiway::ReceiveError,
                     >,
                 > + '_ {
-                    self.#receiver_field.recv()
+                    <<#factory as #hiway::OwnedPortBinding<#event>>::Receiver
+                        as #hiway::EventReceiver<#event>>::event_recv(&self.#receiver_field)
                 }
             }
         }
     });
 
+    quote! {
+        #port_impl
+        #(#publication_impls)*
+        #(#receiver_impls)*
+    }
+}
+
+fn named_port_methods(
+    hiway: &TokenStream2,
+    send: &[(Path, Ident, Ident)],
+    recv: &[(Path, Ident, Ident)],
+) -> TokenStream2 {
     let named_publish_methods = send.iter().map(|(event, _, field)| {
         let publish = format_ident!("publish_{field}");
-        let try_publish = format_ident!("try_publish_{field}");
+        let publish_now = format_ident!("publish_now_{field}");
         quote! {
-            pub fn #publish(
+            pub async fn #publish(
                 &self,
                 payload: <#event as #hiway::EventSpec>::Payload,
-            ) -> #hiway::SendFuture<
-                '_,
-                #event,
-                <Self as #hiway::EventPort<#event>>::Sender,
+            ) -> ::core::result::Result<
+                (),
+                #hiway::SendError<<#event as #hiway::EventSpec>::Payload>,
             > {
                 <Self as #hiway::PortExt>::publish::<#event>(
                     self,
                     #hiway::EventValue::new(payload),
-                )
+                ).await
             }
 
-            pub fn #try_publish(
+            pub fn #publish_now(
                 &self,
                 payload: <#event as #hiway::EventSpec>::Payload,
             ) -> ::core::result::Result<
                 (),
                 #hiway::TrySendError<<#event as #hiway::EventSpec>::Payload>,
             > {
-                <Self as #hiway::PortExt>::try_publish::<#event>(
+                <Self as #hiway::PortExt>::publish_now::<#event>(
                     self,
                     #hiway::EventValue::new(payload),
                 )
@@ -563,51 +645,107 @@ fn expand_port(arguments: &PortArgs, item: &ItemStruct) -> Result<TokenStream2> 
     });
     let named_receive_methods = recv.iter().map(|(event, _, field)| {
         let recv = format_ident!("recv_{field}");
-        let try_recv = format_ident!("try_recv_{field}");
+        let recv_now = format_ident!("recv_now_{field}");
         quote! {
             pub fn #recv(
                 &self,
             ) -> impl ::core::future::Future<
-                Output = ::core::option::Option<
-                    <#event as #hiway::EventSpec>::Payload,
+                    Output = ::core::result::Result<
+                        #hiway::StreamItem<<Self as #hiway::EventReceiver<#event>>::Value>,
+                        #hiway::ReceiveError,
                 >,
             > + '_ {
                 <Self as #hiway::EventReceiver<#event>>::event_recv(self)
             }
 
-            pub fn #try_recv(
+            pub fn #recv_now(
                 &self,
-            ) -> ::core::option::Option<<#event as #hiway::EventSpec>::Payload> {
-                <Self as #hiway::EventReceiver<#event>>::event_try_recv(self)
+            ) -> ::core::result::Result<
+                ::core::option::Option<
+                    #hiway::StreamItem<<Self as #hiway::EventReceiver<#event>>::Value>,
+                >,
+                #hiway::ReceiveError,
+            > {
+                <Self as #hiway::EventReceiver<#event>>::event_recv_now(self)
             }
         }
     });
 
-    Ok(quote! {
-        #(#attrs)*
-        #visibility struct #port {
-            #(#sender_fields,)*
-            #(#receiver_fields,)*
+    quote! {
+        #(#named_publish_methods)*
+        #(#named_receive_methods)*
+    }
+}
+
+fn generic_port_methods(hiway: &TokenStream2) -> TokenStream2 {
+    quote! {
+        pub fn prepare<E>(&self, value: #hiway::EventValue<E>)
+            -> ::core::result::Result<
+                #hiway::PortPreparation<'_, Self, E>,
+                #hiway::TrySendError<E::Payload>,
+            >
+        where E: #hiway::EventSpec, Self: #hiway::EventPort<E> {
+            <Self as #hiway::PortExt>::prepare(self, value)
         }
 
-        impl #port {
-            pub fn bind(
-                factory: &#factory,
-            ) -> ::core::result::Result<Self, #hiway::PortError> {
-                Ok(Self {
-                    #(#sender_initializers,)*
-                    #(#receiver_initializers,)*
-                })
-            }
-
-            #(#named_publish_methods)*
-            #(#named_receive_methods)*
+        pub fn try_recv<E>(&self) -> ::core::result::Result<
+            ::core::option::Option<#hiway::StreamItem<<Self as #hiway::EventReceiver<E>>::Value>>,
+            #hiway::ReceiveError,
+        >
+        where E: #hiway::EventSpec, Self: #hiway::EventReceiver<E> {
+            <Self as #hiway::PortExt>::try_recv::<E>(self)
         }
 
-        #port_impl
-        #(#publication_impls)*
-        #(#receiver_impls)*
-    })
+        pub async fn publish<E>(
+            &self,
+            value: #hiway::EventValue<E>,
+        ) -> ::core::result::Result<(), #hiway::SendError<E::Payload>>
+        where
+            E: #hiway::EventSpec,
+            Self: #hiway::EventPort<E>,
+        {
+            <Self as #hiway::PortExt>::publish(self, value).await
+        }
+
+        pub fn publish_now<E>(
+            &self,
+            value: #hiway::EventValue<E>,
+        ) -> ::core::result::Result<(), #hiway::TrySendError<E::Payload>>
+        where
+            E: #hiway::EventSpec,
+            Self: #hiway::EventPort<E>,
+        {
+            <Self as #hiway::PortExt>::publish_now(self, value)
+        }
+
+        pub async fn recv<E>(
+            &self,
+        ) -> ::core::result::Result<
+            #hiway::StreamItem<<Self as #hiway::EventReceiver<E>>::Value>,
+            #hiway::ReceiveError,
+        >
+        where
+            E: #hiway::EventSpec,
+            Self: #hiway::EventReceiver<E>,
+        {
+            <Self as #hiway::PortExt>::recv::<E>(self).await
+        }
+
+        pub fn recv_now<E>(
+            &self,
+        ) -> ::core::result::Result<
+            ::core::option::Option<
+                #hiway::StreamItem<<Self as #hiway::EventReceiver<E>>::Value>,
+            >,
+            #hiway::ReceiveError,
+        >
+        where
+            E: #hiway::EventSpec,
+            Self: #hiway::EventReceiver<E>,
+        {
+            <Self as #hiway::PortExt>::recv_now::<E>(self)
+        }
+    }
 }
 
 fn capability_list(paths: &[Path], label: &str) -> Result<Vec<(Path, Ident, Ident)>> {
@@ -686,6 +824,45 @@ mod tests {
             .err()
             .expect("removed flag must be rejected");
         assert!(removed_flag.to_string().contains("expected"));
+
+        let capacity = syn::parse_str::<PortArgs>("factory = Bus, capacity = 8")
+            .err()
+            .expect("subscriber capacity must be rejected");
+        assert_eq!(capacity.to_string(), "stream capacity belongs to owner");
+    }
+
+    #[test]
+    fn port_arguments_distinguish_observers_and_required_receivers() {
+        let arguments = syn::parse_str::<PortArgs>(
+            "factory = Bus, send(events::Started), recv(events::Changed), required(events::Stopped)",
+        ).unwrap();
+        assert_eq!(arguments.send.len(), 1);
+        assert_eq!(arguments.send[0].segments.last().unwrap().ident, "Started");
+        assert_eq!(arguments.recv.len(), 1);
+        assert_eq!(arguments.recv[0].segments.last().unwrap().ident, "Changed");
+        assert_eq!(arguments.required.len(), 1);
+        assert_eq!(
+            arguments.required[0].segments.last().unwrap().ident,
+            "Stopped"
+        );
+
+        let repeated = syn::parse_str::<PortArgs>("factory = Bus, required(A), required(B)")
+            .err()
+            .expect("required group cannot be repeated");
+        assert_eq!(repeated.to_string(), "port capability group repeated");
+    }
+
+    #[test]
+    fn port_rejects_receiving_one_event_in_both_roles() {
+        let arguments = syn::parse_str::<PortArgs>(
+            "factory = Bus, recv(events::Changed), required(events::Changed)",
+        )
+        .unwrap();
+        let item = syn::parse_str::<ItemStruct>("struct Receiver;").unwrap();
+        assert_eq!(
+            expand_port(&arguments, &item).unwrap_err().to_string(),
+            "duplicate receive event `Changed`",
+        );
     }
 
     #[test]
