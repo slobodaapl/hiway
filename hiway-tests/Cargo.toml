@@ -5,14 +5,25 @@ edition = "2021"
 rust-version = "1.96.1"
 publish = false
 
+[lib]
+path = "lib.rs"
+
+[[bin]]
+name = "embedded"
+path = "embedded.rs"
+test = false
+bench = false
+
 [features]
 default = []
 std = ["hiway/std"]
+tokio-io = ["std", "hiway/tokio-io"]
 
 [dependencies]
 hiway = { path = "..", default-features = false }
 
 [dev-dependencies]
+stats_alloc = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
 [[test]]
@@ -23,6 +34,16 @@ required-features = ["std"]
 [[test]]
 name = "no_std"
 path = "tests_no_std.rs"
+
+[[test]]
+name = "streams"
+path = "tests_streams.rs"
+required-features = ["std"]
+
+[[test]]
+name = "allocations"
+path = "tests_allocations.rs"
+required-features = ["std"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

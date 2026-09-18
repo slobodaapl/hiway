@@ -15,7 +15,7 @@ pub struct SchemaRevision(pub u32);
 pub struct OriginId([u8; 16]);
 
 impl OriginId {
-    /// The zero origin, useful for local-only messages and tests.
+    /// The zero origin for local-only messages and tests.
     pub const ZERO: Self = Self([0; 16]);
 
     /// Creates an origin from its wire bytes.

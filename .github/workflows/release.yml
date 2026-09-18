@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      publish-macro: ${{ steps.versions.outputs.publish-macro }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.1 --profile minimal
+
+      - name: Check release versions
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          metadata="$(cargo +1.96.1 metadata --no-deps --format-version 1)"
+          hiway_version="$(jq -r '.packages[] | select(.name == "hiway") | .version' <<<"$metadata")"
+          macro_version="$(jq -r '.packages[] | select(.name == "hiway-macros") | .version' <<<"$metadata")"
+          macro_requirement="$(jq -r '.packages[] | select(.name == "hiway") | .dependencies[] | select(.name == "hiway-macros") | .req' <<<"$metadata")"
+
+          [[ "$GITHUB_REF_NAME" == "v$hiway_version" ]]
+          [[ "$macro_requirement" == "=$macro_version" ]]
+
+          response_file="$RUNNER_TEMP/hiway-macros.json"
+          status="$(curl --silent --show-error --header 'User-Agent: hiway-release' --output "$response_file" --write-out '%{http_code}' "https://crates.io/api/v1/crates/hiway-macros/$macro_version")"
+          case "$status" in
+            200)
+              jq -e --arg version "$macro_version" '.version.num == $version and .version.yanked == false' "$response_file" >/dev/null
+              publish_macro=false
+              ;;
+            404)
+              publish_macro=true
+              ;;
+            *)
+              echo "crates.io returned HTTP $status for hiway-macros $macro_version" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "publish-macro=$publish_macro" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/hiway
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.1 --profile minimal
+
+      - name: Publish missing macro version
+        if: needs.prepare.outputs.publish-macro == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo +1.96.1 publish -p hiway-macros --locked
+
+      - name: Wait for macro version in the registry
+        if: needs.prepare.outputs.publish-macro == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            status="$(curl --silent --show-error --header 'User-Agent: hiway-release' --output /dev/null --write-out '%{http_code}' "https://crates.io/api/v1/crates/hiway-macros/$(cargo +1.96.1 metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "hiway-macros") | .version')")"
+            if [[ "$status" == "200" ]]; then
+              exit 0
+            fi
+            sleep 4
+          done
+          echo "hiway-macros was not visible on crates.io" >&2
+          exit 1
+
+      - name: Validate published dependency resolution
+        run: |
+          for attempt in $(seq 1 30); do
+            if cargo +1.96.1 package -p hiway --locked --no-verify >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 4
+          done
+          echo "hiway could not resolve its published macro dependency" >&2
+          exit 1
+
+      - name: Publish hiway
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo +1.96.1 publish -p hiway --locked
+
+  attest:
+    needs:
+      - prepare
+      - publish
+    uses: ./.github/workflows/attest.yml
+    with:
+      include-macro: ${{ needs.prepare.outputs.publish-macro == 'true' }}
+    secrets: inherit

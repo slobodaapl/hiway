@@ -5,15 +5,15 @@ use crate::metadata::{SchemaRevision, WireMajor};
 /// Stable identity for one event specification.
 ///
 /// The declaration macro derives this value from the Rust module path, enum
-/// name, and variant. Payload types are deliberately excluded: two distinct
+/// name, and variant. Payload types are excluded: two distinct
 /// events may carry the same payload type.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct EventId(u128);
 
 impl EventId {
-    const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
-    const PRIME: u128 = 0x0000000001000000000000000000013b;
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
 
     /// Computes the stable FNV-1a-128 identity for a declaration name.
     #[must_use]
@@ -54,9 +54,9 @@ impl fmt::Display for EventId {
 }
 
 /// A routable event declaration.
-pub trait EventSpec: Send + Sync + 'static {
+pub trait EventSpec {
     /// Payload carried by this event specification.
-    type Payload: Clone + Send + 'static;
+    type Payload;
 
     /// Stable identity used by local and remote routing domains.
     const ID: EventId;

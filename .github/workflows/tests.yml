@@ -1,0 +1,66 @@
+name: Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.96.1
+          --profile minimal
+          --component clippy
+          --component rustfmt
+          --target thumbv7em-none-eabi
+
+      - name: Install dependency policy checker
+        run: cargo +1.96.1 install cargo-deny --version 0.19.8 --locked
+
+      - name: Check formatting
+        run: cargo +1.96.1 fmt --all -- --check
+
+      - name: Test supported feature sets
+        run: |
+          cargo +1.96.1 test --workspace --locked
+          cargo +1.96.1 test --workspace --all-features --locked
+          cargo +1.96.1 test -p hiway --no-default-features --locked
+          cargo +1.96.1 test -p hiway --doc --locked
+          cargo +1.96.1 test -p hiway --no-default-features --doc --locked
+
+      - name: Check no_std target
+        run: |
+          cargo +1.96.1 check -p hiway --no-default-features --target thumbv7em-none-eabi --locked
+          cargo +1.96.1 check -p hiway-tests --lib --no-default-features --target thumbv7em-none-eabi --locked
+          cargo +1.96.1 build -p hiway-tests --bin embedded --no-default-features --target thumbv7em-none-eabi --locked
+
+      - name: Lint supported feature sets
+        run: |
+          cargo +1.96.1 clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::pedantic
+          cargo +1.96.1 clippy -p hiway --no-default-features --all-targets --locked -- -D warnings -W clippy::pedantic
+
+      - name: Bounded Loom model (preemption=2; Hiway locks/atomics)
+        env:
+          RUSTFLAGS: --cfg loom
+        run: |
+          cargo +1.96.1 clippy -p hiway-loom --all-targets --locked -- -D warnings -W clippy::pedantic
+          cargo +1.96.1 test -p hiway-loom --locked
+
+      - name: Check dependency policy
+        run: cargo +1.96.1 deny check

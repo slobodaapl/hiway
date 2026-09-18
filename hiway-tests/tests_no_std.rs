@@ -22,3 +22,8 @@ fn explicit_enum_adapter_round_trips_payload() {
         .unwrap();
     assert_eq!(tagged.into_inner().0, 7);
 }
+
+#[test]
+fn multi_event_graph_uses_caller_owned_storage() {
+    assert_eq!(hiway_tests::exercise_static_graph(), Some((42, 90)));
+}

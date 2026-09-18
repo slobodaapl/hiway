@@ -7,6 +7,14 @@ description = "Typed event specifications and bounded local routing"
 license = "MIT"
 readme = "README.md"
 documentation = "https://docs.rs/hiway"
+exclude = [
+    ".github/**",
+    ".gitignore",
+    "deny.toml",
+    "docs/**",
+    "rust-toolchain.toml",
+    "SECURITY.md",
+]
 keywords = ["async", "event-bus", "no-std", "embedded", "typed"]
 categories = ["asynchronous", "no-std", "embedded"]
 
@@ -17,21 +25,55 @@ resolver = "2"
 
 [features]
 default = []
-std = ["dep:arc-swap", "critical-section/std"]
+std = ["dep:tokio", "dep:arc-swap"]
+tokio-io = ["std", "tokio/net", "tokio/io-util", "tokio/rt"]
 
 [dependencies]
+atomic-waker = { version = "1.1", default-features = false }
 arc-swap = { version = "1.9", optional = true }
-critical-section = { version = "1.2", default-features = false }
+tokio = { version = "1", optional = true, default-features = false, features = ["sync", "macros"] }
+spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex"] }
 heapless = { version = "0.9", default-features = false }
 hiway-macros = { version = "=0.1.0", path = "hiway-macros" }
 
-[dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+[target.'cfg(loom)'.dependencies]
+loom = { version = "0.7" }
 
-[[bin]]
-name = "hiwayd"
-path = "src/bin/hiwayd.rs"
+[dev-dependencies]
+stats_alloc = "0.1"
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+
+[[example]]
+name = "basic"
 required-features = ["std"]
+
+[[example]]
+name = "game"
+required-features = ["std"]
+
+[[example]]
+name = "many_components"
+required-features = ["std"]
+
+[[example]]
+name = "terminal"
+required-features = ["std"]
+
+[[example]]
+name = "ipc"
+required-features = ["tokio-io"]
+
+[[example]]
+name = "interference"
+required-features = ["std"]
+
+[[example]]
+name = "ipc_interference"
+required-features = ["tokio-io"]
+
+[[example]]
+name = "ipc_process"
+required-features = ["tokio-io"]
 
 [package.metadata.docs.rs]
 all-features = true

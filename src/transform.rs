@@ -1,18 +1,17 @@
-#![allow(clippy::manual_async_fn)]
-
-use core::future::Future;
+use core::ops::AsyncFn;
 
 /// A typed subscriber-side transformation.
 ///
 /// Implement this trait in an application or event crate to publish reusable
-/// transform components. The returned future may borrow the transform, but it
-/// is never boxed by Hiway.
+/// transform components. The returned future may borrow the transform, but
+/// it is never boxed by Hiway.
+#[allow(async_fn_in_trait)]
 pub trait TransformOp<I> {
     /// Payload type emitted by this transform.
     type Output;
 
     /// Applies the transform to one input payload.
-    fn apply(&self, input: I) -> impl Future<Output = Self::Output> + '_;
+    async fn apply(&self, input: I) -> Self::Output;
 
     /// Composes this transform with a second transform.
     fn then<N>(self, next: N) -> Then<Self, N>
@@ -47,13 +46,12 @@ impl<F> Transform<F> {
 
 impl<I, O, F> TransformOp<I> for Transform<F>
 where
-    I: 'static,
     F: Fn(I) -> O,
 {
     type Output = O;
 
-    fn apply(&self, input: I) -> impl Future<Output = Self::Output> + '_ {
-        async move { (self.function)(input) }
+    async fn apply(&self, input: I) -> Self::Output {
+        (self.function)(input)
     }
 }
 
@@ -70,16 +68,14 @@ impl<F> AsyncTransform<F> {
     }
 }
 
-impl<I, O, F, Fut> TransformOp<I> for AsyncTransform<F>
+impl<I, O, F> TransformOp<I> for AsyncTransform<F>
 where
-    I: 'static,
-    F: Fn(I) -> Fut,
-    Fut: Future<Output = O>,
+    F: AsyncFn(I) -> O,
 {
     type Output = O;
 
-    fn apply(&self, input: I) -> impl Future<Output = Self::Output> + '_ {
-        async move { (self.function)(input).await }
+    async fn apply(&self, input: I) -> Self::Output {
+        (self.function)(input).await
     }
 }
 
@@ -92,16 +88,13 @@ pub struct Then<First, Second> {
 
 impl<I, First, Second> TransformOp<I> for Then<First, Second>
 where
-    I: 'static,
     First: TransformOp<I>,
     Second: TransformOp<First::Output>,
 {
     type Output = Second::Output;
 
-    fn apply(&self, input: I) -> impl Future<Output = Self::Output> + '_ {
-        async move {
-            let intermediate = self.first.apply(input).await;
-            self.second.apply(intermediate).await
-        }
+    async fn apply(&self, input: I) -> Self::Output {
+        let intermediate = self.first.apply(input).await;
+        self.second.apply(intermediate).await
     }
 }

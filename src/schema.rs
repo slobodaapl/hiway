@@ -1,3 +1,5 @@
+use core::fmt;
+
 use crate::{EventId, SchemaRevision, WireMajor};
 
 /// Wire field kind used by a schema manifest.
@@ -56,6 +58,7 @@ pub struct Schema<'a> {
 
 /// Schema compatibility failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SchemaError {
     /// A schema contains duplicate active or reserved tags.
     DuplicateTag(u32),
@@ -75,7 +78,40 @@ pub enum SchemaError {
     MajorChanged,
 }
 
+impl fmt::Display for SchemaError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateTag(tag) => write!(formatter, "schema tag {tag} is duplicated"),
+            Self::FieldKindChanged(tag) => {
+                write!(formatter, "field kind changed for schema tag {tag}")
+            }
+            Self::NewlyRequired(tag) => {
+                write!(formatter, "schema tag {tag} became required")
+            }
+            Self::RequiredFieldMadeOptional(tag) => {
+                write!(formatter, "required schema tag {tag} became optional")
+            }
+            Self::RemovedTagNotReserved(tag) => {
+                write!(formatter, "removed schema tag {tag} is not reserved")
+            }
+            Self::ReservedTagReused(tag) => {
+                write!(formatter, "reserved schema tag {tag} was reused")
+            }
+            Self::EventChanged => formatter.write_str("schema event identity changed"),
+            Self::MajorChanged => formatter.write_str("schema wire major changed"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SchemaError {}
+
 /// Validates one schema's local tag invariants.
+///
+/// # Errors
+///
+/// Returns [`SchemaError::DuplicateTag`] when a tag appears more than once
+/// across active fields and reserved tags.
 pub fn validate_schema(schema: &Schema<'_>) -> Result<(), SchemaError> {
     for (index, field) in schema.fields.iter().enumerate() {
         if schema.fields[index + 1..]
@@ -98,6 +134,12 @@ pub fn validate_schema(schema: &Schema<'_>) -> Result<(), SchemaError> {
 }
 
 /// Checks whether `next` can be read by a reader of `previous`.
+///
+/// # Errors
+///
+/// Returns [`SchemaError`] if either schema has duplicate tags, the event or
+/// wire major changes, a reserved tag is reused, a removed tag is not reserved,
+/// a field changes kind, or a field becomes required or ceases to be required.
 pub fn validate_evolution(previous: &Schema<'_>, next: &Schema<'_>) -> Result<(), SchemaError> {
     validate_schema(previous)?;
     validate_schema(next)?;
