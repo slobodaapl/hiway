@@ -33,7 +33,7 @@ tokio-io = ["std", "tokio/net", "tokio/io-util", "tokio/rt"]
 atomic-waker = { version = "1.1", default-features = false }
 arc-swap = { version = "1.9", optional = true }
 tokio = { version = "1", optional = true, default-features = false, features = ["sync", "macros"] }
-spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex"] }
+spin = { version = "0.12", default-features = false, features = ["mutex", "spin_mutex"] }
 heapless = { version = "0.9", default-features = false }
 hiway-macros = { version = "=0.1.0", path = "hiway-macros" }
 

@@ -19,39 +19,78 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.1 --profile minimal
 
-      - name: Build release package
+      - name: Package crates
+        id: pkgs
+        shell: bash
         run: |
+          set -euo pipefail
+          metadata="$(cargo +1.96.1 metadata --no-deps --format-version 1)"
+          hiway_version="$(jq -r '.packages[] | select(.name == "hiway") | .version' <<<"$metadata")"
+          macro_version="$(jq -r '.packages[] | select(.name == "hiway-macros") | .version' <<<"$metadata")"
+
           cargo +1.96.1 package -p hiway --locked --no-verify
+          hiway_crate="target/package/hiway-${hiway_version}.crate"
+          [[ -f "$hiway_crate" ]]
+          echo "hiway-crate=$hiway_crate" >> "$GITHUB_OUTPUT"
+          echo "hiway-sbom=target/package/hiway.cdx.json" >> "$GITHUB_OUTPUT"
+
           if [[ "${{ inputs.include-macro }}" == "true" ]]; then
             cargo +1.96.1 package -p hiway-macros --locked --no-verify
+            macro_crate="target/package/hiway-macros-${macro_version}.crate"
+            [[ -f "$macro_crate" ]]
+            echo "macro-crate=$macro_crate" >> "$GITHUB_OUTPUT"
+            echo "macro-sbom=target/package/hiway-macros.cdx.json" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Generate CycloneDX SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+      - name: Generate hiway SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26
         with:
-          path: .
+          file: ${{ steps.pkgs.outputs.hiway-crate }}
           format: cyclonedx-json
-          output-file: target/package/hiway.cdx.json
+          output-file: ${{ steps.pkgs.outputs.hiway-sbom }}
           upload-artifact: false
           upload-release-assets: false
 
-      - name: Attest release packages
+      - name: Attest hiway provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: target/package/*.crate
+          subject-path: ${{ steps.pkgs.outputs.hiway-crate }}
 
-      - name: Attest release SBOM
+      - name: Attest hiway SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: target/package/*.crate
-          sbom-path: target/package/hiway.cdx.json
+          subject-path: ${{ steps.pkgs.outputs.hiway-crate }}
+          sbom-path: ${{ steps.pkgs.outputs.hiway-sbom }}
+
+      - name: Generate hiway-macros SBOM
+        if: inputs.include-macro
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26
+        with:
+          file: ${{ steps.pkgs.outputs.macro-crate }}
+          format: cyclonedx-json
+          output-file: ${{ steps.pkgs.outputs.macro-sbom }}
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attest hiway-macros provenance
+        if: inputs.include-macro
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ steps.pkgs.outputs.macro-crate }}
+
+      - name: Attest hiway-macros SBOM
+        if: inputs.include-macro
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ steps.pkgs.outputs.macro-crate }}
+          sbom-path: ${{ steps.pkgs.outputs.macro-sbom }}
 
       - name: Upload release evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -59,6 +98,6 @@ jobs:
           name: release-evidence-${{ github.sha }}
           path: |
             target/package/*.crate
-            target/package/hiway.cdx.json
+            target/package/*.cdx.json
           if-no-files-found: error
           retention-days: 90
