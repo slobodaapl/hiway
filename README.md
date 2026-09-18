@@ -3,8 +3,6 @@
 Typed event streams with scoped authority, bounded retention, and explicit
 backpressure. Event contracts are static; membership and links are dynamic.
 
-[API documentation](https://docs.rs/hiway)
-
 ## Overview
 
 Hiway routes typed events through local streams. Event declarations define the

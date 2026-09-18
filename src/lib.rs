@@ -95,7 +95,7 @@ pub use grant::{Grant, Limits, Permission, Rights, StreamLimits};
 pub use unix::{IpcError, UnixLink};
 
 pub use local::{
-    publish, EventPort, EventReceiver, EventSender, Hiway, OwnedPortBinding, PayloadValue, Port,
+    publish, EventPort, EventReceiver, EventSender, OwnedPortBinding, PayloadValue, Port,
     PortBinding, PortExt, PortPreparation, PreparedSend, StaticFabric, StaticPublication,
     StaticReceiveFuture, StaticReceiver, StaticSendFuture, StaticSender, StaticStream, StreamItem,
     SubscriptionRole, Topic,

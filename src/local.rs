@@ -324,66 +324,6 @@ pub trait OwnedPortBinding<E: EventSpec> {
     fn subscribe_owned(&self, role: SubscriptionRole) -> Result<Self::Receiver, TopicError>;
 }
 
-/// A caller-owned fabric and its typed binding conveniences.
-pub struct Hiway<F> {
-    fabric: F,
-}
-
-impl<F> Hiway<F> {
-    /// Retains the supplied fabric. No runtime or task is created.
-    pub const fn with_fabric(fabric: F) -> Self {
-        Self { fabric }
-    }
-
-    /// Borrows the fabric.
-    pub fn fabric(&self) -> &F {
-        &self.fabric
-    }
-
-    /// Resolves a typed sender.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the fabric's [`PortBinding::sender`] error.
-    pub fn sender<'a, E: EventSpec>(
-        &'a self,
-    ) -> Result<<F as PortBinding<'a, E>>::Sender, TopicError>
-    where
-        F: PortBinding<'a, E>,
-    {
-        self.fabric.sender()
-    }
-
-    /// Resolves a typed topic around the same sender capability.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the fabric's [`PortBinding::sender`] error.
-    pub fn topic<'a, E: EventSpec>(
-        &'a self,
-    ) -> Result<Topic<E, <F as PortBinding<'a, E>>::Sender>, TopicError>
-    where
-        F: PortBinding<'a, E>,
-    {
-        Ok(Topic::new(self.sender()?))
-    }
-
-    /// Acquires a typed subscription.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the fabric's [`PortBinding::subscribe`] error.
-    pub fn subscribe<'a, E: EventSpec>(
-        &'a self,
-        role: SubscriptionRole,
-    ) -> Result<<F as PortBinding<'a, E>>::Receiver, TopicError>
-    where
-        F: PortBinding<'a, E>,
-    {
-        self.fabric.subscribe(role)
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SubscriberKey {
     index: usize,
