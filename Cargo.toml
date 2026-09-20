@@ -15,6 +15,7 @@ exclude = [
     "docs/**",
     "rust-toolchain.toml",
     "SECURITY.md",
+    "**/tests_*.rs",
 ]
 keywords = ["async", "event-bus", "no-std", "embedded", "typed"]
 categories = ["asynchronous", "no-std", "embedded"]
