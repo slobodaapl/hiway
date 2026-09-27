@@ -64,11 +64,13 @@ mod event;
 mod grant;
 mod link;
 mod local;
+pub mod locking;
 mod metadata;
 mod schema;
 #[cfg(feature = "std")]
 mod synchronization;
 pub mod transform;
+pub mod transport;
 #[cfg(all(feature = "tokio-io", unix))]
 mod unix;
 mod wire;

@@ -21,7 +21,7 @@ keywords = ["async", "event-bus", "no-std", "embedded", "typed"]
 categories = ["asynchronous", "no-std", "embedded"]
 
 [workspace]
-members = ["hiway-macros", "hiway-loom", "hiway-tests"]
+members = ["hiway-macros", "hiway-loom", "hiway-tests", "hiway-uring"]
 default-members = [".", "hiway-tests"]
 resolver = "2"
 

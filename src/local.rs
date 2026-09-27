@@ -6,16 +6,12 @@ use core::{
     task::{Context, Poll, Waker},
 };
 
+use crate::locking::{DefaultMutex, Lock, LockFamily, Spin};
 use atomic_waker::AtomicWaker;
 #[cfg(not(loom))]
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 #[cfg(loom)]
-use loom::sync::{
-    atomic::{AtomicBool, AtomicU8, Ordering},
-    Mutex, MutexGuard,
-};
-#[cfg(not(loom))]
-use spin::{Mutex, MutexGuard};
+use loom::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::{
     error::{CloseReason, ReceiveError, SendError, TopicError, TrySendError},
@@ -523,66 +519,38 @@ pub struct StaticStream<
     const CAP: usize,
     const SUBS: usize = 8,
     const WAITERS: usize = 16,
+    M: LockFamily = Spin,
 > where
     E::Payload: Copy,
 {
-    state: Mutex<State<E::Payload, CAP, SUBS>>,
+    state: M::Lock<State<E::Payload, CAP, SUBS>>,
     waiters: [Waiter; WAITERS],
     contended: AtomicBool,
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize>
-    StaticStream<E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily>
+    StaticStream<E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
-    /// Creates an empty stream. Zero retained capacity is invalid.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `CAP` is zero.
-    #[must_use]
-    #[cfg(not(loom))]
-    pub const fn new() -> Self {
+    /// Creates storage using the host's synchronization policy.
+    pub fn with_lock(lock: M) -> Self {
         assert!(CAP > 0, "stream capacity must be greater than zero");
         Self {
-            state: Mutex::new(State::new()),
-            waiters: [const { Waiter::new() }; WAITERS],
-            contended: AtomicBool::new(false),
-        }
-    }
-
-    /// Creates an empty stream using instrumented synchronization.
-    ///
-    /// # Panics
-    /// Panics if `CAP` is zero.
-    #[must_use]
-    #[cfg(loom)]
-    pub fn new() -> Self {
-        assert!(CAP > 0, "stream capacity must be greater than zero");
-        Self {
-            state: Mutex::new(State::new()),
+            state: lock.wrap(State::new()),
             waiters: core::array::from_fn(|_| Waiter::new()),
             contended: AtomicBool::new(false),
         }
     }
 
-    fn try_lock(&self) -> Option<MutexGuard<'_, State<E::Payload, CAP, SUBS>>> {
-        #[cfg(not(loom))]
-        {
-            self.state.try_lock()
-        }
-        #[cfg(loom)]
-        {
-            self.state.try_lock().ok()
-        }
+    fn try_lock(
+        &self,
+    ) -> Option<impl core::ops::DerefMut<Target = State<E::Payload, CAP, SUBS>> + '_> {
+        self.state.try_lock()
     }
 
     fn with<R>(&self, access: impl FnOnce(&mut State<E::Payload, CAP, SUBS>) -> R) -> R {
-        #[cfg(not(loom))]
         let mut state = self.state.lock();
-        #[cfg(loom)]
-        let mut state = self.state.lock().unwrap();
         let result = access(&mut state);
         let changed = core::mem::take(&mut state.changed);
         drop(state);
@@ -665,7 +633,7 @@ where
     }
 
     /// Borrows a sender. The stream owner controls who receives this handle.
-    pub const fn sender(&self) -> StaticSender<'_, E, CAP, SUBS, WAITERS> {
+    pub const fn sender(&self) -> StaticSender<'_, E, CAP, SUBS, WAITERS, M> {
         StaticSender { stream: self }
     }
 
@@ -679,7 +647,7 @@ where
     pub fn subscribe(
         &self,
         role: SubscriptionRole,
-    ) -> Result<StaticReceiver<'_, E, CAP, SUBS, WAITERS>, TopicError> {
+    ) -> Result<StaticReceiver<'_, E, CAP, SUBS, WAITERS, M>, TopicError> {
         let key = self.with(|state| state.subscribe(role))?;
         Ok(StaticReceiver { stream: self, key })
     }
@@ -703,13 +671,55 @@ where
     }
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> Default
-    for StaticStream<E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize>
+    StaticStream<E, CAP, SUBS, WAITERS>
+where
+    E::Payload: Copy,
+{
+    /// Creates an empty stream. Zero retained capacity is invalid.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `CAP` is zero.
+    #[must_use]
+    #[cfg(not(loom))]
+    pub const fn new() -> Self {
+        assert!(CAP > 0, "stream capacity must be greater than zero");
+        Self {
+            state: DefaultMutex::new(State::new()),
+            waiters: [const { Waiter::new() }; WAITERS],
+            contended: AtomicBool::new(false),
+        }
+    }
+
+    /// Creates an empty stream using instrumented synchronization.
+    ///
+    /// # Panics
+    /// Panics if `CAP` is zero.
+    #[must_use]
+    #[cfg(loom)]
+    pub fn new() -> Self {
+        assert!(CAP > 0, "stream capacity must be greater than zero");
+        Self {
+            state: DefaultMutex::new(State::new()),
+            waiters: core::array::from_fn(|_| Waiter::new()),
+            contended: AtomicBool::new(false),
+        }
+    }
+}
+
+impl<
+        E: EventSpec,
+        const CAP: usize,
+        const SUBS: usize,
+        const WAITERS: usize,
+        M: LockFamily + Default,
+    > Default for StaticStream<E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
     fn default() -> Self {
-        Self::new()
+        Self::with_lock(M::default())
     }
 }
 
@@ -720,14 +730,15 @@ pub struct StaticSender<
     const CAP: usize,
     const SUBS: usize = 8,
     const WAITERS: usize = 16,
+    M: LockFamily = Spin,
 > where
     E::Payload: Copy,
 {
-    stream: &'a StaticStream<E, CAP, SUBS, WAITERS>,
+    stream: &'a StaticStream<E, CAP, SUBS, WAITERS, M>,
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> Clone
-    for StaticSender<'_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily> Clone
+    for StaticSender<'_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
@@ -736,15 +747,21 @@ where
     }
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> Copy
-    for StaticSender<'_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily> Copy
+    for StaticSender<'_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
 }
 
-impl<'a, E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize>
-    StaticSender<'a, E, CAP, SUBS, WAITERS>
+impl<
+        'a,
+        E: EventSpec,
+        const CAP: usize,
+        const SUBS: usize,
+        const WAITERS: usize,
+        M: LockFamily,
+    > StaticSender<'a, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
@@ -771,7 +788,7 @@ where
     }
 
     /// Waits for admission using bounded, per-future waiter storage.
-    pub fn send(&self, payload: E::Payload) -> StaticSendFuture<'a, E, CAP, SUBS, WAITERS> {
+    pub fn send(&self, payload: E::Payload) -> StaticSendFuture<'a, E, CAP, SUBS, WAITERS, M> {
         StaticSendFuture {
             stream: self.stream,
             payload: Some(payload),
@@ -780,13 +797,13 @@ where
     }
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> EventSender<E>
-    for StaticSender<'_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily>
+    EventSender<E> for StaticSender<'_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
     type Prepared<'a>
-        = StaticPublication<'a, E, CAP, SUBS, WAITERS>
+        = StaticPublication<'a, E, CAP, SUBS, WAITERS, M>
     where
         Self: 'a;
 
@@ -813,15 +830,16 @@ pub struct StaticPublication<
     const CAP: usize,
     const SUBS: usize,
     const WAITERS: usize,
+    M: LockFamily = Spin,
 > where
     E::Payload: Copy,
 {
-    sender: StaticSender<'a, E, CAP, SUBS, WAITERS>,
+    sender: StaticSender<'a, E, CAP, SUBS, WAITERS, M>,
     value: E::Payload,
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> PreparedSend<E>
-    for StaticPublication<'_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily>
+    PreparedSend<E> for StaticPublication<'_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
@@ -835,15 +853,15 @@ where
     }
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> Port
-    for StaticSender<'_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily> Port
+    for StaticSender<'_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> EventPort<E>
-    for StaticSender<'_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily>
+    EventPort<E> for StaticSender<'_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
@@ -860,15 +878,16 @@ pub struct StaticReceiver<
     const CAP: usize,
     const SUBS: usize = 8,
     const WAITERS: usize = 16,
+    M: LockFamily = Spin,
 > where
     E::Payload: Copy,
 {
-    stream: &'a StaticStream<E, CAP, SUBS, WAITERS>,
+    stream: &'a StaticStream<E, CAP, SUBS, WAITERS, M>,
     key: SubscriberKey,
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize>
-    StaticReceiver<'_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily>
+    StaticReceiver<'_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
@@ -895,7 +914,7 @@ where
 
     /// Waits for data, a gap, or termination.
     #[must_use]
-    pub fn recv(&self) -> StaticReceiveFuture<'_, '_, E, CAP, SUBS, WAITERS> {
+    pub fn recv(&self) -> StaticReceiveFuture<'_, '_, E, CAP, SUBS, WAITERS, M> {
         StaticReceiveFuture {
             receiver: self,
             waiter: None,
@@ -903,8 +922,8 @@ where
     }
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> Drop
-    for StaticReceiver<'_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily> Drop
+    for StaticReceiver<'_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
@@ -920,15 +939,15 @@ where
     }
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> Port
-    for StaticReceiver<'_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily> Port
+    for StaticReceiver<'_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> EventReceiver<E>
-    for StaticReceiver<'_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily>
+    EventReceiver<E> for StaticReceiver<'_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
@@ -952,23 +971,24 @@ pub struct StaticSendFuture<
     const CAP: usize,
     const SUBS: usize = 8,
     const WAITERS: usize = 16,
+    M: LockFamily = Spin,
 > where
     E::Payload: Copy,
 {
-    stream: &'a StaticStream<E, CAP, SUBS, WAITERS>,
+    stream: &'a StaticStream<E, CAP, SUBS, WAITERS, M>,
     payload: Option<E::Payload>,
     waiter: Option<usize>,
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> Unpin
-    for StaticSendFuture<'_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily> Unpin
+    for StaticSendFuture<'_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> Future
-    for StaticSendFuture<'_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily> Future
+    for StaticSendFuture<'_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
@@ -1006,8 +1026,8 @@ where
     }
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> Drop
-    for StaticSendFuture<'_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily> Drop
+    for StaticSendFuture<'_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
@@ -1024,15 +1044,16 @@ pub struct StaticReceiveFuture<
     const CAP: usize,
     const SUBS: usize = 8,
     const WAITERS: usize = 16,
+    M: LockFamily = Spin,
 > where
     E::Payload: Copy,
 {
-    receiver: &'a StaticReceiver<'stream, E, CAP, SUBS, WAITERS>,
+    receiver: &'a StaticReceiver<'stream, E, CAP, SUBS, WAITERS, M>,
     waiter: Option<usize>,
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> Future
-    for StaticReceiveFuture<'_, '_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily> Future
+    for StaticReceiveFuture<'_, '_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
@@ -1056,8 +1077,8 @@ where
     }
 }
 
-impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> Drop
-    for StaticReceiveFuture<'_, '_, E, CAP, SUBS, WAITERS>
+impl<E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize, M: LockFamily> Drop
+    for StaticReceiveFuture<'_, '_, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
@@ -1073,30 +1094,43 @@ pub struct StaticFabric<
     const CAP: usize,
     const SUBS: usize = 8,
     const WAITERS: usize = 16,
+    M: LockFamily = Spin,
 > where
     E::Payload: Copy,
 {
-    stream: &'a StaticStream<E, CAP, SUBS, WAITERS>,
+    stream: &'a StaticStream<E, CAP, SUBS, WAITERS, M>,
 }
 
-impl<'a, E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize>
-    StaticFabric<'a, E, CAP, SUBS, WAITERS>
+impl<
+        'a,
+        E: EventSpec,
+        const CAP: usize,
+        const SUBS: usize,
+        const WAITERS: usize,
+        M: LockFamily,
+    > StaticFabric<'a, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
     /// Borrows one retained stream.
-    pub const fn new(stream: &'a StaticStream<E, CAP, SUBS, WAITERS>) -> Self {
+    pub const fn new(stream: &'a StaticStream<E, CAP, SUBS, WAITERS, M>) -> Self {
         Self { stream }
     }
 }
 
-impl<'a, E: EventSpec, const CAP: usize, const SUBS: usize, const WAITERS: usize> PortBinding<'a, E>
-    for StaticFabric<'a, E, CAP, SUBS, WAITERS>
+impl<
+        'a,
+        E: EventSpec,
+        const CAP: usize,
+        const SUBS: usize,
+        const WAITERS: usize,
+        M: LockFamily,
+    > PortBinding<'a, E> for StaticFabric<'a, E, CAP, SUBS, WAITERS, M>
 where
     E::Payload: Copy,
 {
-    type Sender = StaticSender<'a, E, CAP, SUBS, WAITERS>;
-    type Receiver = StaticReceiver<'a, E, CAP, SUBS, WAITERS>;
+    type Sender = StaticSender<'a, E, CAP, SUBS, WAITERS, M>;
+    type Receiver = StaticReceiver<'a, E, CAP, SUBS, WAITERS, M>;
 
     fn sender(&self) -> Result<Self::Sender, TopicError> {
         Ok(self.stream.sender())

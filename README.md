@@ -23,7 +23,9 @@ the allocating backend. Enable `tokio-io` for Unix-socket links on Unix.
 
 Declare events and the authority a component needs:
 
-```rust,ignore
+```rust
+# #[cfg(feature = "std")]
+# {
 use hiway::{events, port, Grant};
 
 #[events]
@@ -38,6 +40,7 @@ enum Events {
     required(events::Job),
 )]
 struct WorkerPort;
+# }
 ```
 
 `examples/basic.rs` contains a complete worker with two streams.
@@ -158,6 +161,44 @@ let graph = Graph::new(&positions);
 The shorter `(event, capacity)` form keeps the defaults of eight subscriber
 slots and sixteen waiter slots. Each stream may use different dimensions;
 the supplied `StaticStream` must match its graph entry.
+
+`StaticStream::with_lock(policy)` accepts a `locking::LockFamily`. The default
+`StaticStream::new()` keeps the existing spin lock.
+
+## io-uring transport
+
+`hiway-uring` supplies a Linux transport using `io-uring` directly. One
+`Driver` owns a ring shared by its links. The caller chooses the link count,
+frame-buffer size and submission capacity at construction. `export` and
+`import` accept ordinary `EventReceiver`/`EventSender` endpoints and return
+concrete futures; no executor or background thread is installed.
+
+The host polls those futures and calls `advance` for bounded, nonwaiting I/O
+progress. `wait` is a separate blocking host operation. Hosts combining socket
+and local endpoint readiness can register an eventfd for completion notification
+and include local wakers in their own wait mechanism. Revocation is checked on
+poll and driver progress, and authorization is checked before each submission.
+
+The arena never grows after construction. Buffers, operation records and waiter
+slots are reused; transport operations and link removal allocate nothing.
+Application codecs, endpoint implementations, reservation callbacks, supplied
+wakers and the kernel retain their own allocation behavior. Submitted buffers
+and reservation guards remain owned until terminal completion. Link drop marks
+its record closing; driver drop cancels and drains outstanding I/O. If teardown
+cannot establish completion, it retains the domain's storage rather than free
+buffers still accessible to the kernel.
+
+The protocol lives in `hiway::transport`, with no allocator or executor. Its
+pending effects require explicit acceptance and completion, and receive
+completion grants no admission credit. It uses the existing HWY1 data and
+credit format. Grant-backed hosts use `Grant::reserve_transport` with the
+driver's `reservation_bytes()`; static endpoints can use `()`.
+
+```sh
+cargo run -p hiway-uring --example round_trip
+cargo test -p hiway-uring
+cargo bench -p hiway-uring --bench throughput
+```
 
 ## Features
 

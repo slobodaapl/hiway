@@ -23,6 +23,7 @@ tokio-io = ["std", "hiway/tokio-io"]
 hiway = { path = "..", default-features = false }
 
 [dev-dependencies]
+hiway-uring = { path = "../hiway-uring" }
 stats_alloc = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 

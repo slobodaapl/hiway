@@ -53,12 +53,16 @@ mod conditional_event_variants {
     }
 }
 
+#[allow(
+    deprecated,
+    reason = "The fixture tests deprecated enum variants; marker use below denies deprecation."
+)]
 mod conditional_event_semantics {
     use super::{EventSpec, EventValue};
 
     #[hiway::events]
     enum Events {
-        #[cfg(all())]
+        #[cfg(true)]
         Direct(u16),
         #[cfg(any())]
         MissingPayloadType(UnavailablePayload),
@@ -134,7 +138,7 @@ mod explicit_event_ids {
 
     #[hiway::events(wire_major = 1, schema_revision = 1)]
     enum InitialEvents {
-        #[cfg(all())]
+        #[cfg(true)]
         #[event(id = "com.example.inventory.position")]
         Position(u16),
         #[event(id = "com.example.inventory.started")]
@@ -160,10 +164,7 @@ mod explicit_event_ids {
         let started_id = EventId::from_name("com.example.inventory.started");
         let finished_id = EventId::from_name("com.example.inventory.finished");
 
-        assert_eq!(
-            <initial_events::Position as EventSpec>::ID,
-            position_id
-        );
+        assert_eq!(<initial_events::Position as EventSpec>::ID, position_id);
         assert_eq!(
             <refactored_events::Coordinates as EventSpec>::ID,
             position_id
@@ -760,7 +761,10 @@ fn static_graph_routes_with_heterogeneous_stream_dimensions() {
     progress_sender.send_now(ProgressData(17)).unwrap();
 
     assert_eq!(
-        started_receiver.recv_now().unwrap().map(|item| item.map(|value| *value)),
+        started_receiver
+            .recv_now()
+            .unwrap()
+            .map(|item| item.map(|value| *value)),
         Some(StreamItem::Data {
             sequence: 0,
             value: ()
@@ -1045,10 +1049,7 @@ fn schema_existing_errors_precede_reserved_tag_removal() {
             reserved_tags: &[],
             ..next
         };
-        assert_eq!(
-            validate_evolution(&previous, &next),
-            existing_error
-        );
+        assert_eq!(validate_evolution(&previous, &next), existing_error);
     }
 }
 
@@ -1111,10 +1112,7 @@ fn schema_required_field_removal_precedes_missing_reservation_error() {
 
 #[test]
 fn schema_optional_and_defaulted_removals_require_reserved_tags() {
-    for (tag, presence) in [
-        (2, FieldPresence::Optional),
-        (3, FieldPresence::Defaulted),
-    ] {
+    for (tag, presence) in [(2, FieldPresence::Optional), (3, FieldPresence::Defaulted)] {
         let required = FieldSpec {
             tag: 1,
             kind: FieldKind::Unsigned,

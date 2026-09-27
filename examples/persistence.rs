@@ -48,13 +48,15 @@ async fn run_once(state: WorkerState, job: u32) -> Result<WorkerState, Box<dyn E
     let fabric = DynamicFabric::new();
     fabric.create_stream::<events::Job>(StreamConfig::default())?;
     let worker_grant = fabric.grant(
-        &[Permission::new::<events::Job>(Rights::OBSERVE | Rights::REQUIRED).with_limits(
-            StreamLimits {
-                retained_items: 0,
-                subscriptions: 1,
-                waiters: 1,
-            },
-        )],
+        &[
+            Permission::new::<events::Job>(Rights::OBSERVE | Rights::REQUIRED).with_limits(
+                StreamLimits {
+                    retained_items: 0,
+                    subscriptions: 1,
+                    waiters: 1,
+                },
+            ),
+        ],
         Limits {
             streams: 1,
             subscriptions: 1,
@@ -63,11 +65,13 @@ async fn run_once(state: WorkerState, job: u32) -> Result<WorkerState, Box<dyn E
         },
     )?;
     let source = fabric.grant(
-        &[Permission::new::<events::Job>(Rights::PUBLISH).with_limits(StreamLimits {
-            retained_items: 1,
-            subscriptions: 0,
-            waiters: 1,
-        })],
+        &[
+            Permission::new::<events::Job>(Rights::PUBLISH).with_limits(StreamLimits {
+                retained_items: 1,
+                subscriptions: 0,
+                waiters: 1,
+            }),
+        ],
         Limits {
             streams: 1,
             retained_items: 1,

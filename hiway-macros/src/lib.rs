@@ -98,10 +98,8 @@ fn conditional_attribute(meta: &syn::Meta) -> Result<Option<TokenStream2>> {
                     input.parse::<syn::Meta>()?.to_token_stream()
                 };
                 input.parse::<Token![,]>()?;
-                let attributes = input.parse_terminated(
-                    |input| input.parse::<syn::Meta>(),
-                    Token![,],
-                )?;
+                let attributes =
+                    input.parse_terminated(|input| input.parse::<syn::Meta>(), Token![,])?;
                 Ok((predicate, attributes))
             })?;
 
@@ -114,7 +112,9 @@ fn conditional_attribute(meta: &syn::Meta) -> Result<Option<TokenStream2>> {
             if conditional_attributes.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(quote!(cfg_attr(#predicate, #(#conditional_attributes),*))))
+                Ok(Some(
+                    quote!(cfg_attr(#predicate, #(#conditional_attributes),*)),
+                ))
             }
         }
         _ => Ok(None),
