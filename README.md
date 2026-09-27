@@ -47,17 +47,38 @@ struct WorkerPort;
 
 ## Components across backends
 
-`examples/backends.rs` runs the same `Worker<R, S>` with borrowed static
+`examples/backends.rs` runs the same `Worker<P>` with borrowed static
 endpoints and owned dynamic endpoints. Its receive/process/send logic uses
-`EventReceiver` and `EventSender`; only endpoint construction differs.
+`EventReceiver` and `EventPort`; both setups bind the same port declaration:
 
-The static setup owns its `StaticStream`s and lends them to a generated
-graph. Those streams must outlive the worker's endpoints. The dynamic setup
-gets owned endpoints from a `Grant` backed by a `DynamicFabric`.
+```rust
+use hiway::{events, graph, port, StaticStream};
 
-`#[port]` currently generates bindings for an `OwnedPortBinding` factory.
-For borrowed static storage, compose the endpoints through the common traits
-as shown in this example:
+#[events]
+enum Events { Job(u16), Completed(u32) }
+
+#[port(send(events::Completed), required(events::Job))]
+struct WorkerPort;
+
+#[graph(jobs = (events::Job, 2), completed = (events::Completed, 2))]
+struct Graph;
+
+let jobs = StaticStream::new();
+let completed = StaticStream::new();
+let port = WorkerPort::bind(&Graph::new(&jobs, &completed))?;
+# Ok::<(), hiway::PortError>(())
+```
+
+`bind` infers the endpoint types from `PortBinding`. The static streams must
+outlive the port; the graph wrapper need not. With a dynamic `Grant`,
+`WorkerPort::bind(&grant)` returns owned endpoints that retain their grant.
+Dropping the original grant handle does not revoke them; explicit revocation
+still applies.
+
+The existing `#[port(factory = Grant, ...)]` form produces a concrete port
+through `OwnedPortBinding`. Omit `factory` to let the binding supply the
+endpoint types. Components storing that port can use a type parameter, as
+`Worker<P>` does in the example.
 
 ```sh
 cargo run --example backends --features std

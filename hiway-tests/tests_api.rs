@@ -1201,3 +1201,38 @@ fn envelope_header_rejects_values_reserved_for_absent_metadata() {
         Err(WireError::InvalidHeader)
     );
 }
+
+#[tokio::test]
+async fn inferred_owned_port_retains_handles_and_obeys_revocation() {
+    #[port(send(pipewise::Progress), required(pipewise::Progress))]
+    struct InferredPort;
+
+    let fabric = DynamicFabric::new();
+    fabric
+        .create_stream::<pipewise::Progress>(config(2))
+        .unwrap();
+    let grant = component_grant(
+        &fabric,
+        &[Permission::new::<pipewise::Progress>(
+            Rights::PUBLISH | Rights::OBSERVE | Rights::REQUIRED,
+        )
+        .with_limits(DUPLEX_LIMITS)],
+        1,
+    );
+    let revoker = grant.clone();
+    let port = InferredPort::bind(&grant).unwrap();
+    drop(grant);
+    port.publish_progress(ProgressData(42)).await.unwrap();
+    assert!(
+        matches!(port.recv_progress().await.unwrap(), StreamItem::Data { value, .. } if *value == ProgressData(42))
+    );
+    revoker.revoke().await.unwrap();
+    assert!(matches!(
+        port.publish_now_progress(ProgressData(43)),
+        Err(TrySendError::Revoked(ProgressData(43)))
+    ));
+    assert!(matches!(
+        InferredPort::bind(&revoker),
+        Err(PortError::Topic(TopicError::Revoked))
+    ));
+}

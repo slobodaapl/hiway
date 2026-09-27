@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "hiway"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "atomic-waker",
@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "hiway-loom"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hiway",
  "loom",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "hiway-macros"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "hiway-tests"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "hiway",
  "stats_alloc",

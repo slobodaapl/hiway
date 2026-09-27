@@ -1,8 +1,8 @@
 use std::error::Error;
 
 use hiway::{
-    events, graph, DynamicFabric, EventReceiver, EventSender, Limits, Permission, Rights,
-    StaticStream, StreamConfig, StreamItem, StreamLimits, SubscriptionRole,
+    events, graph, port, DynamicFabric, EventPort, EventReceiver, Limits, Permission, PortExt,
+    Rights, StaticStream, StreamConfig, StreamItem, StreamLimits, SubscriptionRole,
 };
 
 #[events]
@@ -11,20 +11,23 @@ enum Events {
     Completed(u32),
 }
 
-struct Worker<R, S> {
-    jobs: R,
-    completed: S,
+#[port(send(events::Completed), required(events::Job))]
+struct WorkerPort;
+
+struct Worker<P> {
+    port: P,
 }
 
-impl<R, S> Worker<R, S>
+impl<P> Worker<P>
 where
-    R: EventReceiver<events::Job>,
-    S: EventSender<events::Completed>,
+    P: EventReceiver<events::Job> + EventPort<events::Completed>,
 {
     async fn complete_next(&self) -> Result<(), Box<dyn Error>> {
-        match self.jobs.event_recv().await? {
+        match self.port.event_recv().await? {
             StreamItem::Data { value, .. } => {
-                self.completed.send(2 * u32::from(*value)).await?;
+                self.port
+                    .publish(events::Completed(2 * u32::from(*value)))
+                    .await?;
             }
             StreamItem::Gap { from, to } => {
                 return Err(format!("worker missed jobs {from}..{to}").into());
@@ -41,12 +44,11 @@ where
 struct Graph;
 
 async fn run_static() -> Result<(), Box<dyn Error>> {
-    let jobs = StaticStream::<events::Job, 2, 1, 2>::new();
-    let completed = StaticStream::<events::Completed, 2, 1, 2>::new();
+    let jobs = StaticStream::new();
+    let completed = StaticStream::new();
     let graph = Graph::new(&jobs, &completed);
     let worker = Worker {
-        jobs: graph.subscribe::<events::Job>(SubscriptionRole::Required)?,
-        completed: graph.sender::<events::Completed>()?,
+        port: WorkerPort::bind(&graph)?,
     };
     let completion = graph.subscribe::<events::Completed>(SubscriptionRole::Required)?;
 
@@ -92,8 +94,7 @@ async fn run_dynamic() -> Result<(), Box<dyn Error>> {
         limits,
     )?;
     let worker = Worker {
-        jobs: grant.subscribe::<events::Job>(SubscriptionRole::Required)?,
-        completed: grant.sender::<events::Completed>()?,
+        port: WorkerPort::bind(&grant)?,
     };
     let completion = grant.subscribe::<events::Completed>(SubscriptionRole::Required)?;
 

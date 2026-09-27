@@ -296,7 +296,7 @@ fn event_identity(hiway: &TokenStream2, enum_name: &Ident, variant: &Ident) -> T
 }
 
 struct PortArgs {
-    factory: Path,
+    factory: Option<Path>,
     send: Vec<Path>,
     recv: Vec<Path>,
     required: Vec<Path>,
@@ -347,7 +347,7 @@ impl Parse for PortArgs {
             }
         }
         Ok(Self {
-            factory: factory.ok_or_else(|| input.error("port requires `factory = Type`"))?,
+            factory,
             send: send.unwrap_or_default(),
             recv: recv.unwrap_or_default(),
             required: required.unwrap_or_default(),
@@ -599,19 +599,99 @@ fn expand_port(arguments: &PortArgs, item: &ItemStruct) -> Result<TokenStream2> 
     let recv = capability_list(&receive_paths, "receive")?;
     let hiway = hiway_path()?;
 
-    let sender_fields = send.iter().map(|(event, _, field)| {
+    let send_paths = &arguments.send;
+    let mut tokens: Vec<_> = quote!(#item #(#send_paths)* #(#receive_paths)* #hiway)
+        .into_iter()
+        .collect();
+    let mut names = std::collections::HashSet::new();
+    while let Some(token) = tokens.pop() {
+        match token {
+            proc_macro2::TokenTree::Group(group) => tokens.extend(group.stream()),
+            proc_macro2::TokenTree::Ident(ident) => {
+                names.insert(ident.to_string().trim_start_matches("r#").to_owned());
+            }
+            _ => {}
+        }
+    }
+    let fresh_ident = |mut name: String| {
+        while names.contains(&name) {
+            name.push('_');
+        }
+        format_ident!("{name}")
+    };
+    let inferred_factory = fresh_ident("__Factory".into());
+    let mut generics = syn::Generics::default();
+    let mut binding_bounds = Vec::new();
+    let mut sender_types = Vec::new();
+    let mut receiver_types = Vec::new();
+    for (capabilities, types, endpoint, bound) in [
+        (
+            &send,
+            &mut sender_types,
+            "Sender",
+            quote!(#hiway::EventSender),
+        ),
+        (
+            &recv,
+            &mut receiver_types,
+            "Receiver",
+            quote!(#hiway::EventReceiver),
+        ),
+    ] {
+        for (index, (event, _, _)) in capabilities.iter().enumerate() {
+            let associated = format_ident!("{endpoint}");
+            if let Some(factory) = factory {
+                types.push(quote!(<#factory as #hiway::OwnedPortBinding<#event>>::#associated));
+            } else {
+                let parameter = fresh_ident(format!("__{endpoint}{index}"));
+                generics
+                    .params
+                    .push(syn::parse_quote!(#parameter: #bound<#event>));
+                binding_bounds.push(quote!(
+                    #hiway::PortBinding<'__binding, #event, #associated = #parameter>
+                ));
+                types.push(quote!(#parameter));
+            }
+        }
+    }
+    let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
+    let (bind_generics, factory_type, bind_where, sender_method, receiver_method) =
+        if let Some(factory) = factory {
+            (
+                quote!(),
+                quote!(#factory),
+                quote!(),
+                quote!(sender_owned),
+                quote!(subscribe_owned),
+            )
+        } else {
+            (
+                quote!(<'__binding, #inferred_factory: ?Sized>),
+                quote!(#inferred_factory),
+                quote!(where #inferred_factory: #(#binding_bounds +)*),
+                quote!(sender),
+                quote!(subscribe),
+            )
+        };
+    let binding = |event: &Path| {
+        if let Some(factory) = factory {
+            quote!(<#factory as #hiway::OwnedPortBinding<#event>>)
+        } else {
+            quote!(<#inferred_factory as #hiway::PortBinding<'__binding, #event>>)
+        }
+    };
+    let sender_fields = send.iter().zip(&sender_types).map(|((_, _, field), ty)| {
         let field = format_ident!("__send_{field}");
-        quote!(#field: <#factory as #hiway::OwnedPortBinding<#event>>::Sender)
+        quote!(#field: #ty)
     });
     let sender_initializers = send.iter().map(|(event, _, field)| {
         let field = format_ident!("__send_{field}");
-        quote!(
-            #field: <#factory as #hiway::OwnedPortBinding<#event>>::sender_owned(factory)?
-        )
+        let binding = binding(event);
+        quote!(#field: #binding::#sender_method(factory)?)
     });
-    let receiver_fields = recv.iter().map(|(event, _, field)| {
+    let receiver_fields = recv.iter().zip(&receiver_types).map(|((_, _, field), ty)| {
         let field = format_ident!("__recv_{field}");
-        quote!(#field: <#factory as #hiway::OwnedPortBinding<#event>>::Receiver)
+        quote!(#field: #ty)
     });
     let receiver_initializers = recv.iter().enumerate().map(|(index, (event, _, field))| {
         let field = format_ident!("__recv_{field}");
@@ -620,27 +700,33 @@ fn expand_port(arguments: &PortArgs, item: &ItemStruct) -> Result<TokenStream2> 
         } else {
             quote!(#hiway::SubscriptionRole::Required)
         };
-        quote!(#field: <#factory as #hiway::OwnedPortBinding<#event>>::subscribe_owned(
-            factory,
-            #role,
-        )?)
+        let binding = binding(event);
+        quote!(#field: #binding::#receiver_method(factory, #role)?)
     });
 
-    let event_impls = port_event_impls(&hiway, factory, port, &send, &recv);
+    let event_impls = port_event_impls(
+        &hiway,
+        &generics,
+        port,
+        &send,
+        &recv,
+        &sender_types,
+        &receiver_types,
+    );
     let named_methods = named_port_methods(&hiway, &send, &recv);
     let generic_methods = generic_port_methods(&hiway);
 
     Ok(quote! {
         #(#attrs)*
-        #visibility struct #port {
+        #visibility struct #port #generics {
             #(#sender_fields,)*
             #(#receiver_fields,)*
         }
 
-        impl #port {
-            pub fn bind(
-                factory: &#factory,
-            ) -> ::core::result::Result<Self, #hiway::PortError> {
+        impl #impl_generics #port #type_generics #where_clause {
+            pub fn bind #bind_generics(
+                factory: &#factory_type,
+            ) -> ::core::result::Result<Self, #hiway::PortError> #bind_where {
                 ::core::result::Result::Ok(Self {
                     #(#sender_initializers,)*
                     #(#receiver_initializers,)*
@@ -658,17 +744,21 @@ fn expand_port(arguments: &PortArgs, item: &ItemStruct) -> Result<TokenStream2> 
 
 fn port_event_impls(
     hiway: &TokenStream2,
-    factory: &Path,
+    generics: &syn::Generics,
     port: &Ident,
     send: &[(Path, Ident, Ident)],
     recv: &[(Path, Ident, Ident)],
+    sender_types: &[TokenStream2],
+    receiver_types: &[TokenStream2],
 ) -> TokenStream2 {
-    let port_impl = quote!(impl #hiway::Port for #port {});
-    let publication_impls = send.iter().map(|(event, _, field)| {
+    let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
+    let port_impl =
+        quote!(impl #impl_generics #hiway::Port for #port #type_generics #where_clause {});
+    let publication_impls = send.iter().zip(sender_types).map(|((event, _, field), sender)| {
         let sender_field = format_ident!("__send_{field}");
         quote! {
-            impl #hiway::EventPort<#event> for #port {
-                type Sender = <#factory as #hiway::OwnedPortBinding<#event>>::Sender;
+            impl #impl_generics #hiway::EventPort<#event> for #port #type_generics #where_clause {
+                type Sender = #sender;
 
                 fn event_sender(&self) -> &Self::Sender {
                     &self.#sender_field
@@ -676,18 +766,18 @@ fn port_event_impls(
             }
         }
     });
-    let receiver_impls = recv.iter().map(|(event, _, field)| {
+    let receiver_impls = recv.iter().zip(receiver_types).map(|((event, _, field), receiver)| {
         let receiver_field = format_ident!("__recv_{field}");
         quote! {
-            impl #hiway::EventReceiver<#event> for #port {
-                type Value = <<#factory as #hiway::OwnedPortBinding<#event>>::Receiver
+            impl #impl_generics #hiway::EventReceiver<#event> for #port #type_generics #where_clause {
+                type Value = <#receiver
                     as #hiway::EventReceiver<#event>>::Value;
 
                 fn event_try_recv(&self) -> ::core::result::Result<
                     ::core::option::Option<#hiway::StreamItem<Self::Value>>,
                     #hiway::ReceiveError,
                 > {
-                    <<#factory as #hiway::OwnedPortBinding<#event>>::Receiver
+                    <#receiver
                         as #hiway::EventReceiver<#event>>::event_try_recv(&self.#receiver_field)
                 }
 
@@ -695,7 +785,7 @@ fn port_event_impls(
                     ::core::option::Option<#hiway::StreamItem<Self::Value>>,
                     #hiway::ReceiveError,
                 > {
-                    <<#factory as #hiway::OwnedPortBinding<#event>>::Receiver
+                    <#receiver
                         as #hiway::EventReceiver<#event>>::event_recv_now(&self.#receiver_field)
                 }
 
@@ -707,7 +797,7 @@ fn port_event_impls(
                         #hiway::ReceiveError,
                     >,
                 > + '_ {
-                    <<#factory as #hiway::OwnedPortBinding<#event>>::Receiver
+                    <#receiver
                         as #hiway::EventReceiver<#event>>::event_recv(&self.#receiver_field)
                 }
             }
@@ -923,16 +1013,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn event_and_port_arguments_reject_removed_or_missing_contracts() {
+    fn event_and_port_arguments_reject_removed_contracts() {
         let namespace = syn::parse_str::<EventsArgs>(r#"namespace = "legacy""#)
             .err()
             .expect("namespace must be rejected");
         assert!(namespace.to_string().contains("unknown event declaration"));
 
-        let missing_factory = syn::parse_str::<PortArgs>("send(events::Started)")
-            .err()
-            .expect("factory must be required");
-        assert!(missing_factory.to_string().contains("factory"));
+        let inferred = syn::parse_str::<PortArgs>("send(events::Started)").unwrap();
+        assert!(inferred.factory.is_none());
 
         let removed_flag = syn::parse_str::<PortArgs>("factory = Bus, no_std")
             .err()

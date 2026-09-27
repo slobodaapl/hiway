@@ -279,6 +279,38 @@ where
 }
 
 /// Binding whose endpoints may borrow caller-owned stream storage.
+///
+/// `#[port]` without `factory` infers its endpoint types through this trait.
+/// A port can outlive the binding wrapper, but cannot outlive borrowed storage:
+///
+/// ```compile_fail,E0597
+/// use hiway::{events, port, StaticFabric, StaticStream};
+/// #[events]
+/// enum Events { Value(u16) }
+/// #[port(send(events::Value))]
+/// struct Publisher;
+/// let publisher = {
+///     let stream = StaticStream::<events::Value, 2>::new();
+///     Publisher::bind(&StaticFabric::new(&stream)).unwrap()
+/// };
+/// publisher.publish_now_value(42).unwrap();
+/// ```
+///
+/// Binding a port exposes only its declared capabilities:
+///
+/// ```compile_fail,E0308
+/// use hiway::{events, graph, port, StaticStream};
+/// #[events]
+/// enum Events { First(u16), Second(u16) }
+/// #[graph(first = (events::First, 2), second = (events::Second, 2))]
+/// struct Graph;
+/// #[port(send(events::First))]
+/// struct Publisher;
+/// let first = StaticStream::new();
+/// let second = StaticStream::new();
+/// let publisher = Publisher::bind(&Graph::new(&first, &second)).unwrap();
+/// publisher.publish_now(events::Second(42)).unwrap();
+/// ```
 pub trait PortBinding<'a, E: EventSpec> {
     /// Sender for the selected stream.
     type Sender: EventSender<E>;

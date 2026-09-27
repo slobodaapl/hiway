@@ -15,8 +15,8 @@ use crate::{
     grant::{Grant, GrantNode, Lease, Limits, Permission, Rights, StreamLimits},
     synchronization::{AtomicBool, AtomicUsize, Mutex, MutexGuard, Ordering, TryLockError},
     CloseReason, EventId, EventPort, EventReceiver, EventSender, EventSpec, OwnedPortBinding, Port,
-    ReceiveError, SendError, StreamItem, SubscriptionRole, TopicError, TopicTypeMismatch,
-    TrySendError,
+    PortBinding, ReceiveError, SendError, StreamItem, SubscriptionRole, TopicError,
+    TopicTypeMismatch, TrySendError,
 };
 
 /// Physical bounds for one retained stream.
@@ -386,6 +386,23 @@ where
     }
 
     fn subscribe_owned(&self, role: SubscriptionRole) -> Result<Self::Receiver, TopicError> {
+        self.subscribe::<E>(role)
+    }
+}
+
+impl<'a, E> PortBinding<'a, E> for Grant
+where
+    E: EventSpec + 'static,
+    E::Payload: Send + Sync + 'static,
+{
+    type Sender = DynamicSender<E>;
+    type Receiver = DynamicReceiver<E>;
+
+    fn sender(&self) -> Result<Self::Sender, TopicError> {
+        self.sender::<E>()
+    }
+
+    fn subscribe(&self, role: SubscriptionRole) -> Result<Self::Receiver, TopicError> {
         self.subscribe::<E>(role)
     }
 }
