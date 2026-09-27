@@ -68,10 +68,14 @@ pub enum SchemaError {
     NewlyRequired(u32),
     /// A field that was required became omittable in a compatible revision.
     RequiredFieldMadeOptional(u32),
+    /// A required field was removed in a compatible revision.
+    RequiredFieldRemoved(u32),
     /// A removed tag was not reserved.
     RemovedTagNotReserved(u32),
     /// A tag reserved by the previous revision was reused.
     ReservedTagReused(u32),
+    /// A tag reserved by the previous revision is no longer reserved.
+    ReservedTagRemoved(u32),
     /// The event identity changed.
     EventChanged,
     /// A breaking wire generation changed without a separate route.
@@ -91,11 +95,17 @@ impl fmt::Display for SchemaError {
             Self::RequiredFieldMadeOptional(tag) => {
                 write!(formatter, "required schema tag {tag} became optional")
             }
+            Self::RequiredFieldRemoved(tag) => {
+                write!(formatter, "required schema tag {tag} was removed")
+            }
             Self::RemovedTagNotReserved(tag) => {
                 write!(formatter, "removed schema tag {tag} is not reserved")
             }
             Self::ReservedTagReused(tag) => {
                 write!(formatter, "reserved schema tag {tag} was reused")
+            }
+            Self::ReservedTagRemoved(tag) => {
+                write!(formatter, "reserved schema tag {tag} is no longer reserved")
             }
             Self::EventChanged => formatter.write_str("schema event identity changed"),
             Self::MajorChanged => formatter.write_str("schema wire major changed"),
@@ -138,8 +148,9 @@ pub fn validate_schema(schema: &Schema<'_>) -> Result<(), SchemaError> {
 /// # Errors
 ///
 /// Returns [`SchemaError`] if either schema has duplicate tags, the event or
-/// wire major changes, a reserved tag is reused, a removed tag is not reserved,
-/// a field changes kind, or a field becomes required or ceases to be required.
+/// wire major changes, a reserved tag is reused or no longer reserved, a removed
+/// tag is not reserved, a field changes kind, or a field becomes required or
+/// ceases to be required.
 pub fn validate_evolution(previous: &Schema<'_>, next: &Schema<'_>) -> Result<(), SchemaError> {
     validate_schema(previous)?;
     validate_schema(next)?;
@@ -154,10 +165,16 @@ pub fn validate_evolution(previous: &Schema<'_>, next: &Schema<'_>) -> Result<()
         if next.fields.iter().any(|field| field.tag == *tag) {
             return Err(SchemaError::ReservedTagReused(*tag));
         }
+        if !next.reserved_tags.contains(tag) {
+            return Err(SchemaError::ReservedTagRemoved(*tag));
+        }
     }
 
     for old in previous.fields {
         let Some(current) = next.fields.iter().find(|field| field.tag == old.tag) else {
+            if old.presence == FieldPresence::Required {
+                return Err(SchemaError::RequiredFieldRemoved(old.tag));
+            }
             if !next.reserved_tags.contains(&old.tag) {
                 return Err(SchemaError::RemovedTagNotReserved(old.tag));
             }

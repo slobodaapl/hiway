@@ -87,6 +87,40 @@ impl EventsArgs {
     }
 }
 
+fn conditional_attribute(meta: &syn::Meta) -> Result<Option<TokenStream2>> {
+    match meta {
+        syn::Meta::List(list) if list.path.is_ident("cfg") => Ok(Some(quote!(#meta))),
+        syn::Meta::List(list) if list.path.is_ident("cfg_attr") => {
+            let (predicate, attributes) = list.parse_args_with(|input: ParseStream<'_>| {
+                let predicate = if input.peek(syn::LitBool) {
+                    input.parse::<syn::LitBool>()?.to_token_stream()
+                } else {
+                    input.parse::<syn::Meta>()?.to_token_stream()
+                };
+                input.parse::<Token![,]>()?;
+                let attributes = input.parse_terminated(
+                    |input| input.parse::<syn::Meta>(),
+                    Token![,],
+                )?;
+                Ok((predicate, attributes))
+            })?;
+
+            let mut conditional_attributes = Vec::new();
+            for attribute in attributes {
+                if let Some(attribute) = conditional_attribute(&attribute)? {
+                    conditional_attributes.push(attribute);
+                }
+            }
+            if conditional_attributes.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(quote!(cfg_attr(#predicate, #(#conditional_attributes),*))))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2> {
     if !item.generics.params.is_empty() {
         return Err(Error::new_spanned(
@@ -110,6 +144,12 @@ fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2
     let mut implementations = Vec::with_capacity(item.variants.len());
     let mut enum_conversions = Vec::with_capacity(item.variants.len());
     for variant in &item.variants {
+        let mut conditional_attributes = Vec::new();
+        for attribute in &variant.attrs {
+            if let Some(attribute) = conditional_attribute(&attribute.meta)? {
+                conditional_attributes.push(attribute);
+            }
+        }
         let name = &variant.ident;
         let (payload, enum_value, conversion_arm, constructor) = match &variant.fields {
             Fields::Unit => (
@@ -147,15 +187,18 @@ fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2
         };
 
         markers.push(quote! {
+            #(#[#conditional_attributes])*
             #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
             #marker_visibility struct #name {
                 _private: (),
             }
 
+            #(#[#conditional_attributes])*
             #constructor
         });
         let event_id = event_identity(&hiway, enum_name, name);
         implementations.push(quote! {
+            #(#[#conditional_attributes])*
             impl #hiway::EventSpec for #module::#name {
                 type Payload = #payload;
                 const ID: #hiway::EventId = #event_id;
@@ -163,12 +206,14 @@ fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2
             }
         });
         enum_conversions.push(quote! {
+            #(#[#conditional_attributes])*
             impl ::core::convert::From<#hiway::EventValue<#module::#name>> for #enum_name {
                 fn from(value: #hiway::EventValue<#module::#name>) -> Self {
                     #enum_value
                 }
             }
 
+            #(#[#conditional_attributes])*
             impl ::core::convert::TryFrom<#enum_name> for #hiway::EventValue<#module::#name> {
                 type Error = #enum_name;
 

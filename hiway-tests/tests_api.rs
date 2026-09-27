@@ -33,6 +33,102 @@ enum Versioned {
     Value(u32),
 }
 
+mod conditional_event_variants {
+    use super::EventValue;
+
+    #[hiway::events]
+    enum Events {
+        Always(u8),
+        #[cfg(any())]
+        Disabled(u8),
+    }
+
+    #[test]
+    fn enabled_variant_still_converts() {
+        let combined: Events = events::Always(7).into();
+        let tagged = EventValue::<events::Always>::try_from(combined)
+            .ok()
+            .unwrap();
+        assert_eq!(tagged.into_inner(), 7);
+    }
+}
+
+mod conditional_event_semantics {
+    use super::{EventSpec, EventValue};
+
+    #[hiway::events]
+    enum Events {
+        #[cfg(all())]
+        Direct(u16),
+        #[cfg(any())]
+        MissingPayloadType(UnavailablePayload),
+        #[cfg_attr(all(), cfg_attr(all(), cfg(all())))]
+        NestedEnabled(u32),
+        #[cfg_attr(all(), cfg_attr(all(), cfg(any())))]
+        NestedDisabled(UnavailableNestedPayload),
+        #[cfg_attr(false, cfg(any()))]
+        OuterConditionFalse(u32),
+        #[cfg_attr(all(), deprecated(note = "enum variant attribute only"))]
+        Deprecated(u16),
+        #[cfg_attr(true, cfg(all()))]
+        Unit,
+        #[cfg(any())]
+        DisabledUnit,
+    }
+
+    const UNIT: EventValue<events::Unit> = events::Unit;
+
+    #[test]
+    #[deny(deprecated)]
+    fn enabled_conditional_events_keep_public_conversions() {
+        fn assert_event_spec<T: EventSpec>() {}
+
+        assert_event_spec::<events::Direct>();
+        assert_event_spec::<events::NestedEnabled>();
+        assert_event_spec::<events::Deprecated>();
+        assert_event_spec::<events::Unit>();
+
+        let direct: EventValue<events::Direct> = events::Direct(12);
+        let combined: Events = direct.into();
+        assert_eq!(
+            EventValue::<events::Direct>::try_from(combined)
+                .ok()
+                .unwrap()
+                .into_inner(),
+            12
+        );
+
+        let nested: EventValue<events::NestedEnabled> = events::NestedEnabled(34);
+        let combined: Events = nested.into();
+        assert_eq!(
+            EventValue::<events::NestedEnabled>::try_from(combined)
+                .ok()
+                .unwrap()
+                .into_inner(),
+            34
+        );
+
+        let other: Events = events::OuterConditionFalse(56).into();
+        assert!(matches!(
+            EventValue::<events::NestedEnabled>::try_from(other),
+            Err(Events::OuterConditionFalse(56))
+        ));
+
+        let deprecated: EventValue<events::Deprecated> = events::Deprecated(78);
+        let combined: Events = deprecated.into();
+        assert_eq!(
+            EventValue::<events::Deprecated>::try_from(combined)
+                .ok()
+                .unwrap()
+                .into_inner(),
+            78
+        );
+
+        let combined: Events = UNIT.into();
+        let _: EventValue<events::Unit> = EventValue::try_from(combined).ok().unwrap();
+    }
+}
+
 #[port(
     factory = Grant,
     send(pipewise::Started),
@@ -747,6 +843,200 @@ fn schema_reservations_remain_unreusable_across_revisions() {
         validate_evolution(&previous, &next),
         Err(hiway::SchemaError::ReservedTagReused(7))
     );
+}
+
+#[test]
+fn schema_reserved_tag_cannot_be_forgotten_between_revisions() {
+    let previous = hiway::Schema {
+        event: EventId::from_name("schema::reservation-history"),
+        wire_major: WireMajor(1),
+        revision: hiway::SchemaRevision(1),
+        fields: &[],
+        reserved_tags: &[7],
+    };
+    let next = hiway::Schema {
+        event: EventId::from_name("schema::reservation-history"),
+        wire_major: WireMajor(1),
+        revision: hiway::SchemaRevision(2),
+        fields: &[],
+        reserved_tags: &[],
+    };
+
+    assert_eq!(
+        validate_evolution(&previous, &next),
+        Err(hiway::SchemaError::ReservedTagRemoved(7))
+    );
+}
+
+#[test]
+fn schema_reservations_survive_revisions_and_allow_additions() {
+    let previous = hiway::Schema {
+        event: EventId::from_name("schema::reservation-history"),
+        wire_major: WireMajor(1),
+        revision: hiway::SchemaRevision(1),
+        fields: &[],
+        reserved_tags: &[7, 9],
+    };
+    let next = hiway::Schema {
+        event: EventId::from_name("schema::reservation-history"),
+        wire_major: WireMajor(1),
+        revision: hiway::SchemaRevision(3),
+        fields: &[],
+        reserved_tags: &[9, 7, 11],
+    };
+
+    assert_eq!(validate_evolution(&previous, &next), Ok(()));
+}
+
+#[test]
+fn schema_existing_errors_precede_reserved_tag_removal() {
+    let previous = hiway::Schema {
+        event: EventId::from_name("schema::reservation-history"),
+        wire_major: WireMajor(1),
+        revision: hiway::SchemaRevision(1),
+        fields: &[],
+        reserved_tags: &[7],
+    };
+    let duplicate_fields = [
+        FieldSpec {
+            tag: 8,
+            kind: FieldKind::Unsigned,
+            presence: FieldPresence::Optional,
+        },
+        FieldSpec {
+            tag: 8,
+            kind: FieldKind::Unsigned,
+            presence: FieldPresence::Optional,
+        },
+    ];
+    for (event_name, major, fields) in [
+        ("schema::other-event", 1, &[][..]),
+        ("schema::reservation-history", 2, &[][..]),
+        ("schema::reservation-history", 1, &duplicate_fields[..]),
+    ] {
+        let next = hiway::Schema {
+            event: EventId::from_name(event_name),
+            wire_major: WireMajor(major),
+            revision: hiway::SchemaRevision(2),
+            fields,
+            reserved_tags: &[7],
+        };
+        let existing_error = validate_evolution(&previous, &next);
+        assert!(existing_error.is_err());
+
+        let next = hiway::Schema {
+            reserved_tags: &[],
+            ..next
+        };
+        assert_eq!(
+            validate_evolution(&previous, &next),
+            existing_error
+        );
+    }
+}
+
+#[test]
+fn schema_required_field_removal_is_rejected_when_reserved() {
+    let previous_fields = [FieldSpec {
+        tag: 1,
+        kind: FieldKind::Unsigned,
+        presence: FieldPresence::Required,
+    }];
+    let next_fields = [];
+    let previous = hiway::Schema {
+        event: EventId::from_name("schema::required-removal"),
+        wire_major: WireMajor(1),
+        revision: hiway::SchemaRevision(1),
+        fields: &previous_fields,
+        reserved_tags: &[],
+    };
+    let next = hiway::Schema {
+        event: EventId::from_name("schema::required-removal"),
+        wire_major: WireMajor(1),
+        revision: hiway::SchemaRevision(2),
+        fields: &next_fields,
+        reserved_tags: &[1],
+    };
+
+    assert_eq!(
+        validate_evolution(&previous, &next),
+        Err(hiway::SchemaError::RequiredFieldRemoved(1))
+    );
+}
+
+#[test]
+fn schema_required_field_removal_precedes_missing_reservation_error() {
+    let previous_fields = [FieldSpec {
+        tag: 1,
+        kind: FieldKind::Unsigned,
+        presence: FieldPresence::Required,
+    }];
+    let previous = hiway::Schema {
+        event: EventId::from_name("schema::required-removal"),
+        wire_major: WireMajor(1),
+        revision: hiway::SchemaRevision(1),
+        fields: &previous_fields,
+        reserved_tags: &[],
+    };
+    let next = hiway::Schema {
+        event: EventId::from_name("schema::required-removal"),
+        wire_major: WireMajor(1),
+        revision: hiway::SchemaRevision(2),
+        fields: &[],
+        reserved_tags: &[],
+    };
+
+    assert_eq!(
+        validate_evolution(&previous, &next),
+        Err(hiway::SchemaError::RequiredFieldRemoved(1))
+    );
+}
+
+#[test]
+fn schema_optional_and_defaulted_removals_require_reserved_tags() {
+    for (tag, presence) in [
+        (2, FieldPresence::Optional),
+        (3, FieldPresence::Defaulted),
+    ] {
+        let required = FieldSpec {
+            tag: 1,
+            kind: FieldKind::Unsigned,
+            presence: FieldPresence::Required,
+        };
+        let removable = FieldSpec {
+            tag,
+            kind: FieldKind::Unsigned,
+            presence,
+        };
+        let previous_fields = [required, removable];
+        let next_fields = [required];
+        let event = EventId::from_name("schema::omittable-removal");
+        let previous = hiway::Schema {
+            event,
+            wire_major: WireMajor(1),
+            revision: hiway::SchemaRevision(1),
+            fields: &previous_fields,
+            reserved_tags: &[],
+        };
+        let next = hiway::Schema {
+            event,
+            wire_major: WireMajor(1),
+            revision: hiway::SchemaRevision(2),
+            fields: &next_fields,
+            reserved_tags: &[],
+        };
+        assert_eq!(
+            validate_evolution(&previous, &next),
+            Err(hiway::SchemaError::RemovedTagNotReserved(tag))
+        );
+
+        let reserved_tags = [tag];
+        let next = hiway::Schema {
+            reserved_tags: &reserved_tags,
+            ..next
+        };
+        assert_eq!(validate_evolution(&previous, &next), Ok(()));
+    }
 }
 
 #[test]
