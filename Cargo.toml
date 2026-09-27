@@ -42,11 +42,21 @@ hiway-macros = { version = "=0.1.0", path = "hiway-macros" }
 loom = { version = "0.7" }
 
 [dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 stats_alloc = "0.1"
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 
 [[example]]
 name = "basic"
+required-features = ["std"]
+
+[[example]]
+name = "backends"
+required-features = ["std"]
+
+[[example]]
+name = "persistence"
 required-features = ["std"]
 
 [[example]]

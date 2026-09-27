@@ -363,6 +363,8 @@ struct GraphEntry {
     field: SynIdent,
     event: Path,
     capacity: LitInt,
+    subscribers: LitInt,
+    waiters: LitInt,
 }
 
 impl Parse for GraphArgs {
@@ -376,13 +378,31 @@ impl Parse for GraphArgs {
             let event: Path = content.parse()?;
             content.parse::<Token![,]>()?;
             let capacity: LitInt = content.parse()?;
-            if !content.is_empty() {
-                return Err(content.error("expected `(event, capacity)`"));
-            }
+            let (subscribers, waiters) = if content.is_empty() {
+                (syn::parse_quote!(8), syn::parse_quote!(16))
+            } else {
+                if !content.peek(Token![,]) {
+                    return Err(content.error(
+                        "expected `(event, capacity)` or `(event, capacity, subscribers, waiters)`",
+                    ));
+                }
+                content.parse::<Token![,]>()?;
+                let subscribers: LitInt = content.parse()?;
+                content.parse::<Token![,]>()?;
+                let waiters: LitInt = content.parse()?;
+                if !content.is_empty() {
+                    return Err(content.error(
+                        "expected `(event, capacity)` or `(event, capacity, subscribers, waiters)`",
+                    ));
+                }
+                (subscribers, waiters)
+            };
             entries.push(GraphEntry {
                 field,
                 event,
                 capacity,
+                subscribers,
+                waiters,
             });
             if input.peek(Token![,]) {
                 input.parse::<Token![,]>()?;
@@ -441,16 +461,20 @@ fn expand_graph(arguments: &GraphArgs, item: &ItemStruct) -> Result<TokenStream2
         let field = &entry.field;
         let event = &entry.event;
         let capacity = &entry.capacity;
+        let subscribers = &entry.subscribers;
+        let waiters = &entry.waiters;
         quote! {
-            #field: #hiway::StaticFabric<'route, #event, #capacity, 8, 16>
+            #field: #hiway::StaticFabric<'route, #event, #capacity, #subscribers, #waiters>
         }
     });
     let constructor_parameters = arguments.entries.iter().map(|entry| {
         let field = &entry.field;
         let event = &entry.event;
         let capacity = &entry.capacity;
+        let subscribers = &entry.subscribers;
+        let waiters = &entry.waiters;
         quote! {
-            #field: &'route #hiway::StaticStream<#event, #capacity, 8, 16>
+            #field: &'route #hiway::StaticStream<#event, #capacity, #subscribers, #waiters>
         }
     });
     let constructor_fields = arguments.entries.iter().map(|entry| {
@@ -523,8 +547,10 @@ fn graph_binding(
     let field = &entry.field;
     let event = &entry.event;
     let capacity = &entry.capacity;
+    let subscribers = &entry.subscribers;
+    let waiters = &entry.waiters;
     let binding = quote!(
-        <#hiway::StaticFabric<'route, #event, #capacity, 8, 16>
+        <#hiway::StaticFabric<'route, #event, #capacity, #subscribers, #waiters>
             as #hiway::PortBinding<'route, #event>>
     );
     quote! {

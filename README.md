@@ -45,35 +45,98 @@ struct WorkerPort;
 `examples/many_components.rs` shows one port type shared by many instances.
 `examples/terminal.rs` shows an observer-only component.
 
-## Stable event identities
+## Components across backends
+
+`examples/backends.rs` runs the same `Worker<R, S>` with borrowed static
+endpoints and owned dynamic endpoints. Its receive/process/send logic uses
+`EventReceiver` and `EventSender`; only endpoint construction differs.
+
+The static setup owns its `StaticStream`s and lends them to a generated
+graph. Those streams must outlive the worker's endpoints. The dynamic setup
+gets owned endpoints from a `Grant` backed by a `DynamicFabric`.
+
+`#[port]` currently generates bindings for an `OwnedPortBinding` factory.
+For borrowed static storage, compose the endpoints through the common traits
+as shown in this example:
+
+```sh
+cargo run --example backends --features std
+```
+
+## Persisting application state
+
+`examples/persistence.rs` separates serializable `WorkerState` from a live
+`WorkerPort`. It processes one job, serializes the state to JSON, drops the
+runtime, then deserializes the snapshot and processes another job.
+
+Each run creates its fabric and grants at the composition root and calls
+`WorkerPort::bind` with an authorized grant. The restored worker keeps its
+application state but receives a fresh subscription. The snapshot contains
+no grant, port or subscription cursor; loading it does not restore authority
+or replay position.
+
+```sh
+cargo run --example persistence --features std
+```
+
+Serde and JSON are choices made by this example. The Hiway library does not
+serialize application state or runtime endpoints.
+
+## Event identities
 
 By default, `#[events]` derives each event ID from its Rust module path, enum
 name and variant name. Moving or renaming a declaration changes that ID.
-For protocols shared across processes or releases, give each variant an
-explicit identity:
+Use this default for ordinary declarations. Once published, the declaration's
+name and module path are part of its protocol identity.
+
+Use `#[event(id = "...")]` when a rename or move must preserve a published
+identity, or when matching an externally defined protocol name. For example,
+a renamed declaration can retain the ID of `jobs_api::jobs::Jobs::Submitted`:
 
 ```rust
 use hiway::events;
 
 #[events(wire_major = 1, schema_revision = 1)]
 enum JobEvents {
-    #[event(id = "com.example.jobs.submitted")]
-    Submitted(u32),
-    #[event(id = "com.example.jobs.completed")]
-    Completed,
+    #[event(id = "jobs_api::jobs::Jobs::Submitted")]
+    Queued(u32),
 }
 ```
 
 The full string is hashed with `EventId::from_name`; Rust names and payload
 types are excluded. Keep the string unchanged when refactoring the source.
-Variants without `#[event(id = "...")]` retain the default identity scheme.
-Use distinct names for distinct protocol events. An explicit ID does not
-make incompatible payload changes compatible: `wire_major` and
+There is no need to repeat a declaration's name in a string unless this
+compatibility requirement exists. An explicit ID does not make incompatible
+payload changes compatible: `wire_major` and
 `schema_revision` still describe the wire format's evolution.
 
 Adding an explicit identity to an existing event changes its ID unless the
 string matches its previous fully qualified Rust name. Use that old name to
 preserve an existing route, or coordinate the identity change with its peers.
+
+## Static graph storage
+
+`#[graph]` borrows streams owned by the caller. Each entry can specify its
+payload capacity, subscriber slots and waiter slots:
+
+```rust
+use hiway::{events, graph, StaticStream};
+
+#[events]
+enum Events {
+    Position(u16),
+}
+
+#[graph(position = (events::Position, 4, 2, 3))]
+struct Graph;
+
+let positions = StaticStream::<events::Position, 4, 2, 3>::new();
+let graph = Graph::new(&positions);
+```
+
+The shorter `(event, capacity)` form keeps the defaults of eight subscriber
+slots and sixteen waiter slots. Each stream may use different dimensions;
+the supplied `StaticStream` must match its graph entry.
 
 ## Features
 

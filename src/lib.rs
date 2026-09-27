@@ -48,8 +48,8 @@
 //! [`WireMajor`] identifies a breaking wire generation. [`SchemaRevision`]
 //! identifies a compatible revision within that generation. [`WireCodec`],
 //! [`validate_schema`], and [`validate_evolution`] keep those changes explicit.
-//! Payload types do not identify routes, and Hiway does not introduce a Serde
-//! dependency or a serialized runtime endpoint.
+//! Payload types do not identify routes. The Hiway library has no Serde
+//! dependency and does not serialize runtime endpoints.
 
 extern crate self as hiway;
 

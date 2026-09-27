@@ -231,6 +231,12 @@ struct PairPort;
 )]
 struct TestGraph;
 
+#[graph(
+    started = (pipewise::Started, 1, 1, 2),
+    progress = (pipewise::Progress, 3, 2, 4),
+)]
+struct HeterogeneousGraph;
+
 struct Counter<P> {
     port: P,
     value: u32,
@@ -727,6 +733,51 @@ fn static_graph_composes_multiple_streams_with_runtime_membership() {
             value: ProgressData(12)
         })
     );
+}
+
+#[test]
+fn static_graph_routes_with_heterogeneous_stream_dimensions() {
+    let started = StaticStream::<pipewise::Started, 1, 1, 2>::new();
+    let progress = StaticStream::<pipewise::Progress, 3, 2, 4>::new();
+    let graph = HeterogeneousGraph::new(&started, &progress);
+
+    let started_receiver = graph
+        .subscribe::<pipewise::Started>(SubscriptionRole::Required)
+        .unwrap();
+    let progress_sender = graph.sender::<pipewise::Progress>().unwrap();
+    let progress_required = graph
+        .subscribe::<pipewise::Progress>(SubscriptionRole::Required)
+        .unwrap();
+    let progress_observer = graph
+        .subscribe::<pipewise::Progress>(SubscriptionRole::Observer)
+        .unwrap();
+
+    graph
+        .sender::<pipewise::Started>()
+        .unwrap()
+        .send_now(())
+        .unwrap();
+    progress_sender.send_now(ProgressData(17)).unwrap();
+
+    assert_eq!(
+        started_receiver.recv_now().unwrap().map(|item| item.map(|value| *value)),
+        Some(StreamItem::Data {
+            sequence: 0,
+            value: ()
+        })
+    );
+    for receiver in [progress_required, progress_observer] {
+        assert_eq!(
+            receiver
+                .recv_now()
+                .unwrap()
+                .map(|item| item.map(|value| *value)),
+            Some(StreamItem::Data {
+                sequence: 0,
+                value: ProgressData(17)
+            })
+        );
+    }
 }
 
 #[tokio::test]
