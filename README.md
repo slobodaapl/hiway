@@ -45,6 +45,36 @@ struct WorkerPort;
 `examples/many_components.rs` shows one port type shared by many instances.
 `examples/terminal.rs` shows an observer-only component.
 
+## Stable event identities
+
+By default, `#[events]` derives each event ID from its Rust module path, enum
+name and variant name. Moving or renaming a declaration changes that ID.
+For protocols shared across processes or releases, give each variant an
+explicit identity:
+
+```rust
+use hiway::events;
+
+#[events(wire_major = 1, schema_revision = 1)]
+enum JobEvents {
+    #[event(id = "com.example.jobs.submitted")]
+    Submitted(u32),
+    #[event(id = "com.example.jobs.completed")]
+    Completed,
+}
+```
+
+The full string is hashed with `EventId::from_name`; Rust names and payload
+types are excluded. Keep the string unchanged when refactoring the source.
+Variants without `#[event(id = "...")]` retain the default identity scheme.
+Use distinct names for distinct protocol events. An explicit ID does not
+make incompatible payload changes compatible: `wire_major` and
+`schema_revision` still describe the wire format's evolution.
+
+Adding an explicit identity to an existing event changes its ID unless the
+string matches its previous fully qualified Rust name. Use that old name to
+preserve an existing route, or coordinate the identity change with its peers.
+
 ## Features
 
 The default feature set is empty. The main feature combinations are:

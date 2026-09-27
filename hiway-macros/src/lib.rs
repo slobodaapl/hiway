@@ -121,6 +121,41 @@ fn conditional_attribute(meta: &syn::Meta) -> Result<Option<TokenStream2>> {
     }
 }
 
+fn explicit_event_id(attributes: &[syn::Attribute]) -> Result<Option<syn::LitStr>> {
+    let mut id = None;
+    for attribute in attributes
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("event"))
+    {
+        let mut found_id = false;
+        attribute.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("id") {
+                return Err(meta.error("unknown event attribute field"));
+            }
+            if id.is_some() {
+                return Err(meta.error("duplicate event id"));
+            }
+            let value = meta.value()?.parse::<syn::LitStr>()?;
+            if value.value().is_empty() {
+                return Err(syn::Error::new_spanned(
+                    &value,
+                    "event id must not be empty",
+                ));
+            }
+            found_id = true;
+            id = Some(value);
+            Ok(())
+        })?;
+        if !found_id {
+            return Err(syn::Error::new_spanned(
+                attribute,
+                "event attribute requires `id = \"...\"`",
+            ));
+        }
+    }
+    Ok(id)
+}
+
 fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2> {
     if !item.generics.params.is_empty() {
         return Err(Error::new_spanned(
@@ -129,6 +164,7 @@ fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2
         ));
     }
 
+    let mut item = (*item).clone();
     let hiway = hiway_path()?;
     let visibility = &item.vis;
     let enum_name = &item.ident;
@@ -143,7 +179,11 @@ fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2
     let mut markers = Vec::with_capacity(item.variants.len());
     let mut implementations = Vec::with_capacity(item.variants.len());
     let mut enum_conversions = Vec::with_capacity(item.variants.len());
-    for variant in &item.variants {
+    for variant in &mut item.variants {
+        let explicit_id = explicit_event_id(&variant.attrs)?;
+        variant
+            .attrs
+            .retain(|attribute| !attribute.path().is_ident("event"));
         let mut conditional_attributes = Vec::new();
         for attribute in &variant.attrs {
             if let Some(attribute) = conditional_attribute(&attribute.meta)? {
@@ -196,7 +236,10 @@ fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2
             #(#[#conditional_attributes])*
             #constructor
         });
-        let event_id = event_identity(&hiway, enum_name, name);
+        let event_id = match explicit_id {
+            Some(id) => quote!(#hiway::EventId::from_name(#id)),
+            None => event_identity(&hiway, enum_name, name),
+        };
         implementations.push(quote! {
             #(#[#conditional_attributes])*
             impl #hiway::EventSpec for #module::#name {

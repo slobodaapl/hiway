@@ -129,6 +129,72 @@ mod conditional_event_semantics {
     }
 }
 
+mod explicit_event_ids {
+    use super::{EventId, EventSpec, EventValue};
+
+    #[hiway::events(wire_major = 1, schema_revision = 1)]
+    enum InitialEvents {
+        #[cfg(all())]
+        #[event(id = "com.example.inventory.position")]
+        Position(u16),
+        #[event(id = "com.example.inventory.started")]
+        Started,
+        #[cfg(any())]
+        #[event(id = "com.example.inventory.disabled")]
+        Disabled(UnavailablePayload),
+    }
+
+    #[hiway::events(wire_major = 7, schema_revision = 9)]
+    enum RefactoredEvents {
+        #[event(id = "com.example.inventory.position")]
+        Coordinates(u64),
+        #[event(id = "com.example.inventory.started")]
+        Began,
+        #[event(id = "com.example.inventory.finished")]
+        Finished,
+    }
+
+    #[test]
+    fn explicit_ids_survive_declaration_changes_and_keep_conversions() {
+        let position_id = EventId::from_name("com.example.inventory.position");
+        let started_id = EventId::from_name("com.example.inventory.started");
+        let finished_id = EventId::from_name("com.example.inventory.finished");
+
+        assert_eq!(
+            <initial_events::Position as EventSpec>::ID,
+            position_id
+        );
+        assert_eq!(
+            <refactored_events::Coordinates as EventSpec>::ID,
+            position_id
+        );
+        assert_eq!(<initial_events::Started as EventSpec>::ID, started_id);
+        assert_eq!(<refactored_events::Began as EventSpec>::ID, started_id);
+        assert_eq!(<refactored_events::Finished as EventSpec>::ID, finished_id);
+        assert_ne!(position_id, finished_id);
+
+        let position: EventValue<initial_events::Position> = initial_events::Position(12);
+        let combined: InitialEvents = position.into();
+        assert_eq!(
+            EventValue::<initial_events::Position>::try_from(combined)
+                .ok()
+                .unwrap()
+                .into_inner(),
+            12
+        );
+
+        let started: EventValue<initial_events::Started> = initial_events::Started;
+        let combined: InitialEvents = started.into();
+        assert_eq!(
+            EventValue::<initial_events::Started>::try_from(combined)
+                .ok()
+                .unwrap()
+                .into_inner(),
+            ()
+        );
+    }
+}
+
 #[port(
     factory = Grant,
     send(pipewise::Started),

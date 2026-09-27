@@ -4,9 +4,10 @@ use crate::metadata::{SchemaRevision, WireMajor};
 
 /// Stable identity for one event specification.
 ///
-/// The declaration macro derives this value from the Rust module path, enum
-/// name, and variant. Payload types are excluded: two distinct
-/// events may carry the same payload type.
+/// By default, the declaration macro derives this value from the Rust module
+/// path, enum name, and variant. A variant's `#[event(id = "...")]` overrides
+/// that input with an explicit protocol name that survives source refactoring.
+/// Payload types are excluded: two distinct events may carry the same payload.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct EventId(u128);
@@ -15,7 +16,7 @@ impl EventId {
     const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
     const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
 
-    /// Computes the stable FNV-1a-128 identity for a declaration name.
+    /// Computes the stable FNV-1a-128 identity for an event name.
     #[must_use]
     pub const fn from_name(name: &str) -> Self {
         let bytes = name.as_bytes();
