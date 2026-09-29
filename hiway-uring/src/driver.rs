@@ -75,8 +75,43 @@ impl<G> Slot<G> {
     }
 }
 
+struct Ready<const LINKS: usize> {
+    entries: [usize; LINKS],
+    present: [bool; LINKS],
+    head: usize,
+    len: usize,
+}
+impl<const LINKS: usize> Ready<LINKS> {
+    fn new() -> Self {
+        Self {
+            entries: [0; LINKS],
+            present: [false; LINKS],
+            head: 0,
+            len: 0,
+        }
+    }
+    fn push(&mut self, index: usize) {
+        if !self.present[index] {
+            self.entries[(self.head + self.len) % LINKS] = index;
+            self.present[index] = true;
+            self.len += 1;
+        }
+    }
+    fn at(&self, offset: usize) -> usize {
+        self.entries[(self.head + offset) % LINKS]
+    }
+    fn pop(&mut self) -> usize {
+        let index = self.entries[self.head];
+        self.head = (self.head + 1) % LINKS;
+        self.len -= 1;
+        self.present[index] = false;
+        index
+    }
+}
+
 struct Shared<G, const LINKS: usize, const BYTES: usize> {
     slots: RefCell<[Slot<G>; LINKS]>,
+    ready: RefCell<Ready<LINKS>>,
     buffers: Box<[Buffers<BYTES>]>,
 }
 
@@ -89,7 +124,6 @@ struct Shared<G, const LINKS: usize, const BYTES: usize> {
 pub struct Driver<G: Reservation = (), const LINKS: usize = 8, const BYTES: usize = 4096> {
     ring: ManuallyDrop<IoUring>,
     shared: ManuallyDrop<Rc<Shared<G, LINKS, BYTES>>>,
-    cursor: usize,
     pending_completions: usize,
 }
 
@@ -123,16 +157,19 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
             ring: ManuallyDrop::new(ring),
             shared: ManuallyDrop::new(Rc::new(Shared {
                 slots: RefCell::new(std::array::from_fn(Slot::new)),
+                ready: RefCell::new(Ready::new()),
                 buffers: buffers.into_boxed_slice(),
             })),
-            cursor: 0,
             pending_completions: 0,
         })
     }
 
     /// Per-link arena bytes to reserve in an accounting adapter.
     pub const fn reservation_bytes() -> usize {
-        std::mem::size_of::<Slot<G>>() + std::mem::size_of::<Buffers<BYTES>>()
+        std::mem::size_of::<Slot<G>>()
+            + std::mem::size_of::<Buffers<BYTES>>()
+            + std::mem::size_of::<usize>()
+            + std::mem::size_of::<bool>()
     }
 
     fn attach<E: WireCodec>(
@@ -157,6 +194,7 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         slot.sockets = Some((data, control));
         slot.reservation = Some(reservation);
         slot.alive = true;
+        self.shared.ready.borrow_mut().push(index);
         Ok(Handle {
             shared: Rc::clone(&self.shared),
             index,
@@ -185,7 +223,7 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         Ok(transport::import(sender, io))
     }
 
-    /// One bounded pass over completions and links, followed by nonwaiting
+    /// One bounded pass over completions, authority and ready links, followed by nonwaiting
     /// submission. Independent links batch into the same ring.
     pub fn advance(&mut self) -> io::Result<usize> {
         let budget = self.ring.params().cq_entries();
@@ -208,31 +246,38 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
                 .is_some_and(Reservation::is_revoked)
             {
                 if let Some(protocol) = &mut slot.protocol {
-                    let _ = protocol.input(Input::Revoked);
+                    if protocol.closed().is_none() {
+                        let _ = protocol.input(Input::Revoked);
+                        self.shared.ready.borrow_mut().push(index);
+                    }
                 }
             }
+        }
+        let ready = self.shared.ready.borrow().len;
+        // Cleanup gets first use of the reserved SQ space, even under saturation.
+        for offset in 0..ready {
+            let index = self.shared.ready.borrow().at(offset);
+            let mut slots = self.shared.slots.borrow_mut();
+            let slot = &mut slots[index];
             if slot.protocol.as_ref().is_some_and(|p| p.closed().is_some()) {
                 for operation in &mut slot.operations {
                     operation.cancel();
                     operation.reclaim();
                 }
             }
-        }
-        // Cleanup gets first use of the reserved SQ space, even under saturation.
-        for index in 0..LINKS {
+            drop(slots);
             for lane in Lane::ALL {
                 self.cancel(index, lane);
             }
         }
-        for step in 0..LINKS {
-            let index = (self.cursor + step) % LINKS;
+        for _ in 0..ready {
+            let index = self.shared.ready.borrow_mut().pop();
             for lane in Lane::ALL {
                 self.submit(index, lane);
             }
             self.reclaim(index);
             self.wake(index);
         }
-        self.cursor = (self.cursor + 1) % LINKS;
         self.ring.submit()?;
         Ok(completed)
     }
@@ -299,6 +344,7 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
             }
         }
         operation.reclaim();
+        self.shared.ready.borrow_mut().push(index / 3);
         let wake = slot.waker.take();
         drop(slots);
         if let Some(wake) = wake {
@@ -355,6 +401,7 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
                     Input::Closed(Error::Topic(error))
                 };
                 let _ = protocol.input(input);
+                self.shared.ready.borrow_mut().push(index);
                 return;
             }
         };
@@ -365,6 +412,7 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
                 Some(id) => id,
                 None => {
                     let _ = protocol.input(Input::Closed(Error::Capacity));
+                    self.shared.ready.borrow_mut().push(index);
                     return;
                 }
             }
@@ -421,7 +469,22 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
     fn wake(&self, index: usize) {
         let mut slots = self.shared.slots.borrow_mut();
         let slot = &mut slots[index];
-        let ready = slot.protocol.as_ref().is_some_and(|p| p.closed().is_some());
+        let work = slot.operations.iter().any(|op| op.cancellation().is_some())
+            || slot.protocol.as_ref().is_some_and(|p| {
+                Lane::ALL.into_iter().any(|lane| {
+                    matches!(
+                        slot.operations[lane as usize].phase(),
+                        Phase::Available | Phase::Prepared
+                    ) && matches!(
+                        p.effect(lane),
+                        Some(Effect::Receive { .. } | Effect::Transmit { .. })
+                    )
+                })
+            });
+        if work {
+            self.shared.ready.borrow_mut().push(index);
+        }
+        let ready = work || slot.protocol.as_ref().is_some_and(|p| p.closed().is_some());
         let wake = if ready { slot.waker.take() } else { None };
         drop(slots);
         if let Some(wake) = wake {
@@ -432,9 +495,10 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
 
 impl<G: Reservation, const LINKS: usize, const BYTES: usize> Drop for Driver<G, LINKS, BYTES> {
     fn drop(&mut self) {
-        for slot in self.shared.slots.borrow_mut().iter_mut() {
+        for (index, slot) in self.shared.slots.borrow_mut().iter_mut().enumerate() {
             if let Some(protocol) = &mut slot.protocol {
                 let _ = protocol.input(Input::Closed(Error::Closed));
+                self.shared.ready.borrow_mut().push(index);
             }
         }
         loop {
@@ -515,7 +579,9 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Frames for Handle<G
         // SAFETY: Provide has no active data operation; no other handle exists.
         let output = unsafe { &mut *self.shared.buffers[self.index].data.get() };
         let length = transport::encode_frame::<E>(sequence, payload, output)?;
-        protocol.input(Input::Provided { sequence, length })
+        protocol.input(Input::Provided { sequence, length })?;
+        self.shared.ready.borrow_mut().push(self.index);
+        Ok(())
     }
 
     fn poll_frame<E: WireCodec>(
@@ -542,7 +608,9 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Frames for Handle<G
 
     fn admitted(&mut self) -> Result<(), Error> {
         let mut slots = self.shared.slots.borrow_mut();
-        Self::status(&mut slots[self.index])?.input(Input::Admitted)
+        Self::status(&mut slots[self.index])?.input(Input::Admitted)?;
+        self.shared.ready.borrow_mut().push(self.index);
+        Ok(())
     }
 
     fn poll_endpoint<F: Future>(
@@ -575,6 +643,7 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Frames for Handle<G
         let mut slots = self.shared.slots.borrow_mut();
         if let Some(protocol) = &mut slots[self.index].protocol {
             let _ = protocol.input(Input::Closed(error));
+            self.shared.ready.borrow_mut().push(self.index);
         }
     }
 }

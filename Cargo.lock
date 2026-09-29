@@ -172,6 +172,7 @@ version = "0.2.0"
 dependencies = [
  "hiway",
  "io-uring",
+ "libc",
  "stats_alloc",
 ]
 

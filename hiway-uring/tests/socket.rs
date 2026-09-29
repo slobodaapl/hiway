@@ -121,11 +121,68 @@ fn sockets_admit_and_cancel_without_transport_allocations() {
     assert_eq!(allocations.allocations, 0);
     assert_eq!(allocations.reallocations, 0);
     admission_credit_waits_for_destination();
+    saturated_idle_receives_do_not_strand_submission();
     dropping_driver_finishes_kernel_ownership();
     revocation_retains_outstanding_charges();
     forgetting_a_future_does_not_abandon_kernel_storage();
     failed_links_reclaim_and_reuse_the_slot();
     callback_panic_retains_kernel_storage();
+}
+
+fn saturated_idle_receives_do_not_strand_submission() {
+    let mut driver = Driver::<(), 8, 64>::new(2).unwrap();
+    use std::os::fd::{AsFd, FromRawFd};
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    assert!(fd >= 0);
+    let mut completions = unsafe { std::fs::File::from_raw_fd(fd) };
+    driver.register_eventfd(completions.as_fd()).unwrap();
+    let destination = StaticStream::<Number, 1>::new();
+    let receiver = destination.subscribe(SubscriptionRole::Required).unwrap();
+    let signal = Arc::new(Signal(AtomicBool::new(false)));
+    let waker = Waker::from(signal.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut peers = Vec::new();
+    let mut imports = Vec::new();
+    for _ in 0..8 {
+        let (peer, data) = UnixStream::pair().unwrap();
+        let (control_peer, control) = UnixStream::pair().unwrap();
+        peers.push((peer, control_peer));
+        imports.push(Box::pin(
+            driver
+                .import(destination.sender(), data, control, ())
+                .unwrap(),
+        ));
+    }
+    for import in &mut imports {
+        assert!(import.as_mut().poll(&mut cx).is_pending());
+    }
+    let mut frame = [0; 46];
+    hiway::transport::encode_frame::<Number>(0, &73, &mut frame).unwrap();
+    peers.last_mut().unwrap().0.write_all(&frame).unwrap();
+    driver.advance().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let completed = match completions.read(&mut [0; 8]) {
+            Ok(8) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            other => panic!("completion notification: {other:?}"),
+        };
+        if signal.0.swap(false, Ordering::SeqCst) || completed {
+            for import in &mut imports {
+                assert!(import.as_mut().poll(&mut cx).is_pending());
+            }
+            driver.advance().unwrap();
+        }
+        if let Some(StreamItem::Data { value, .. }) = receiver.recv_now().unwrap() {
+            assert_eq!(*value, 73);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "SQ saturation stranded the active link without a wake"
+        );
+        std::thread::yield_now();
+    }
 }
 
 fn failed_links_reclaim_and_reuse_the_slot() {

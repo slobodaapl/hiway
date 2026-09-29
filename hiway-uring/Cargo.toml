@@ -8,13 +8,14 @@ license = "MIT"
 repository = "https://github.com/slobodaapl/hiway"
 
 [dependencies]
-hiway = { version = "=0.2.0", path = "..", default-features = false }
+hiway = { version = "=0.2.0", path = "../hiway", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.15", default-features = false }
 
 [dev-dependencies]
 stats_alloc = "0.1"
+libc = "0.2"
 
 [[bench]]
 name = "throughput"

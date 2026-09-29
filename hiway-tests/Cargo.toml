@@ -20,7 +20,7 @@ std = ["hiway/std"]
 tokio-io = ["std", "hiway/tokio-io"]
 
 [dependencies]
-hiway = { path = "..", default-features = false }
+hiway = { path = "../hiway", default-features = false }
 
 [dev-dependencies]
 hiway-uring = { path = "../hiway-uring" }
