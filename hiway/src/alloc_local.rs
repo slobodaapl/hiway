@@ -390,7 +390,7 @@ where
     }
 }
 
-impl<'a, E> PortBinding<'a, E> for Grant
+impl<E> PortBinding<'_, E> for Grant
 where
     E: EventSpec + 'static,
     E::Payload: Send + Sync + 'static,

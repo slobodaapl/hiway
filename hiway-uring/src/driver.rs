@@ -15,10 +15,10 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-const CANCEL: u64 = 1 << 31;
+const CANCEL: u32 = 1 << 31;
 
 fn token(id: OpId) -> u64 {
-    ((id.generation as u64) << 32) | id.slot as u64
+    (u64::from(id.generation) << 32) | u64::from(id.slot)
 }
 
 struct Buffers<const BYTES: usize> {
@@ -58,6 +58,8 @@ struct Slot<G> {
     waker: Option<Waker>,
 }
 impl<G> Slot<G> {
+    // Driver::new bounds operation indices below the cancellation bit.
+    #[allow(clippy::cast_possible_truncation)]
     fn new(index: usize) -> Self {
         Self {
             protocol: None,
@@ -75,8 +77,43 @@ impl<G> Slot<G> {
     }
 }
 
+struct Ready<const LINKS: usize> {
+    entries: [usize; LINKS],
+    present: [bool; LINKS],
+    head: usize,
+    len: usize,
+}
+impl<const LINKS: usize> Ready<LINKS> {
+    fn new() -> Self {
+        Self {
+            entries: [0; LINKS],
+            present: [false; LINKS],
+            head: 0,
+            len: 0,
+        }
+    }
+    fn push(&mut self, index: usize) {
+        if !self.present[index] {
+            self.entries[(self.head + self.len) % LINKS] = index;
+            self.present[index] = true;
+            self.len += 1;
+        }
+    }
+    fn at(&self, offset: usize) -> usize {
+        self.entries[(self.head + offset) % LINKS]
+    }
+    fn pop(&mut self) -> usize {
+        let index = self.entries[self.head];
+        self.head = (self.head + 1) % LINKS;
+        self.len -= 1;
+        self.present[index] = false;
+        index
+    }
+}
+
 struct Shared<G, const LINKS: usize, const BYTES: usize> {
     slots: RefCell<[Slot<G>; LINKS]>,
+    ready: RefCell<Ready<LINKS>>,
     buffers: Box<[Buffers<BYTES>]>,
 }
 
@@ -89,13 +126,15 @@ struct Shared<G, const LINKS: usize, const BYTES: usize> {
 pub struct Driver<G: Reservation = (), const LINKS: usize = 8, const BYTES: usize = 4096> {
     ring: ManuallyDrop<IoUring>,
     shared: ManuallyDrop<Rc<Shared<G, LINKS, BYTES>>>,
-    cursor: usize,
     pending_completions: usize,
 }
 
 impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BYTES> {
     /// `entries` includes one submission slot reserved for cancellation.
     /// Buffer bounds include the 38-byte HWY1 header.
+    ///
+    /// # Errors
+    /// Returns invalid capacity, arena allocation or ring setup errors.
     pub fn new(entries: u32) -> io::Result<Self> {
         if LINKS == 0
             || LINKS > (CANCEL as usize) / 3
@@ -111,7 +150,17 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
             .and_then(|count| u32::try_from(count).ok())
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
         // Every original operation and its cancellation may complete together.
-        let ring = IoUring::builder().setup_cqsize(cq_entries).build(entries)?;
+        let ring = IoUring::builder()
+            .setup_cqsize(cq_entries)
+            .setup_coop_taskrun()
+            .build(entries)
+            .or_else(|error| {
+                if error.kind() == io::ErrorKind::InvalidInput {
+                    IoUring::builder().setup_cqsize(cq_entries).build(entries)
+                } else {
+                    Err(error)
+                }
+            })?;
         let mut buffers = Vec::new();
         buffers
             .try_reserve_exact(LINKS)
@@ -123,16 +172,20 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
             ring: ManuallyDrop::new(ring),
             shared: ManuallyDrop::new(Rc::new(Shared {
                 slots: RefCell::new(std::array::from_fn(Slot::new)),
+                ready: RefCell::new(Ready::new()),
                 buffers: buffers.into_boxed_slice(),
             })),
-            cursor: 0,
             pending_completions: 0,
         })
     }
 
     /// Per-link arena bytes to reserve in an accounting adapter.
+    #[must_use]
     pub const fn reservation_bytes() -> usize {
-        std::mem::size_of::<Slot<G>>() + std::mem::size_of::<Buffers<BYTES>>()
+        std::mem::size_of::<Slot<G>>()
+            + std::mem::size_of::<Buffers<BYTES>>()
+            + std::mem::size_of::<usize>()
+            + std::mem::size_of::<bool>()
     }
 
     fn attach<E: WireCodec>(
@@ -157,12 +210,17 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         slot.sockets = Some((data, control));
         slot.reservation = Some(reservation);
         slot.alive = true;
+        self.shared.ready.borrow_mut().push(index);
         Ok(Handle {
             shared: Rc::clone(&self.shared),
             index,
         })
     }
 
+    /// Attaches an authorized export using the caller's receiver and sockets.
+    ///
+    /// # Errors
+    /// Returns authority, reservation, buffer or link-capacity rejection.
     pub fn export<E: WireCodec, R: EventReceiver<E>>(
         &self,
         receiver: R,
@@ -174,6 +232,10 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         Ok(transport::export(receiver, io))
     }
 
+    /// Attaches an authorized import using the caller's sender and sockets.
+    ///
+    /// # Errors
+    /// Returns authority, reservation, buffer or link-capacity rejection.
     pub fn import<E: WireCodec, S: EventSender<E>>(
         &self,
         sender: S,
@@ -185,8 +247,11 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         Ok(transport::import(sender, io))
     }
 
-    /// One bounded pass over completions and links, followed by nonwaiting
+    /// One bounded pass over completions, authority and ready links, followed by nonwaiting
     /// submission. Independent links batch into the same ring.
+    ///
+    /// # Errors
+    /// Returns submission errors; queued operations retain their storage.
     pub fn advance(&mut self) -> io::Result<usize> {
         let budget = self.ring.params().cq_entries();
         let mut completed = 0;
@@ -208,39 +273,51 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
                 .is_some_and(Reservation::is_revoked)
             {
                 if let Some(protocol) = &mut slot.protocol {
-                    let _ = protocol.input(Input::Revoked);
+                    if protocol.closed().is_none() {
+                        let _ = protocol.input(Input::Revoked);
+                        self.shared.ready.borrow_mut().push(index);
+                    }
                 }
             }
+        }
+        let ready = self.shared.ready.borrow().len;
+        // Cleanup gets first use of the reserved SQ space, even under saturation.
+        for offset in 0..ready {
+            let index = self.shared.ready.borrow().at(offset);
+            let mut slots = self.shared.slots.borrow_mut();
+            let slot = &mut slots[index];
             if slot.protocol.as_ref().is_some_and(|p| p.closed().is_some()) {
                 for operation in &mut slot.operations {
                     operation.cancel();
                     operation.reclaim();
                 }
             }
-        }
-        // Cleanup gets first use of the reserved SQ space, even under saturation.
-        for index in 0..LINKS {
+            drop(slots);
             for lane in Lane::ALL {
                 self.cancel(index, lane);
             }
         }
-        for step in 0..LINKS {
-            let index = (self.cursor + step) % LINKS;
+        for _ in 0..ready {
+            let index = self.shared.ready.borrow_mut().pop();
             for lane in Lane::ALL {
                 self.submit(index, lane);
             }
             self.reclaim(index);
             self.wake(index);
         }
-        self.cursor = (self.cursor + 1) % LINKS;
-        self.ring.submit()?;
+        if self.pending_completions != 0 {
+            self.ring.submit()?;
+        }
         Ok(completed)
     }
 
     /// Explicit host wait. Do not call this from a future's `poll` method.
     /// Local endpoint readiness still belongs to the host's executor/waker.
+    ///
+    /// # Errors
+    /// Returns the kernel's submission or wait error.
     pub fn wait(&mut self) -> io::Result<usize> {
-        if self.pending_completions == 0 {
+        if self.pending_completions == 0 || !self.ring.completion().is_empty() {
             return Ok(0);
         }
         self.ring.submit_and_wait(1)
@@ -248,10 +325,14 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
 
     /// Connects CQ notification to a host-owned eventfd/reactor. Register before
     /// entering the host wait; local endpoint wakes remain a separate source.
+    ///
+    /// # Errors
+    /// Returns the kernel's eventfd registration error.
     pub fn register_eventfd(&self, eventfd: BorrowedFd<'_>) -> io::Result<()> {
         self.ring.submitter().register_eventfd(eventfd.as_raw_fd())
     }
 
+    #[must_use]
     pub fn active_links(&self) -> usize {
         self.shared
             .slots
@@ -261,8 +342,11 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
             .count()
     }
 
+    // Tokens deliberately unpack their two u32 words. The negative-result
+    // branch handles errors before a completion length is converted to usize.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn complete(&mut self, user_data: u64, result: i32) {
-        let index = (user_data as u32 & !(CANCEL as u32)) as usize;
+        let index = (user_data as u32 & !CANCEL) as usize;
         if index / 3 >= LINKS {
             return;
         }
@@ -274,7 +358,7 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         let mut slots = self.shared.slots.borrow_mut();
         let slot = &mut slots[index / 3];
         let operation = &mut slot.operations[lane as usize];
-        if user_data & CANCEL != 0 {
+        if user_data & u64::from(CANCEL) != 0 {
             operation.cancel_completed(id);
         } else if operation.completed(id) {
             if let Some(protocol) = &mut slot.protocol {
@@ -299,6 +383,7 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
             }
         }
         operation.reclaim();
+        self.shared.ready.borrow_mut().push(index / 3);
         let wake = slot.waker.take();
         drop(slots);
         if let Some(wake) = wake {
@@ -314,7 +399,7 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         };
         let entry = opcode::AsyncCancel::new(token(id))
             .build()
-            .user_data(token(id) | CANCEL);
+            .user_data(token(id) | u64::from(CANCEL));
         // SAFETY: cancellation owns no borrowed memory. Its CQE has a separate
         // tag, and the original buffer stays retained through both completions.
         if unsafe { self.ring.submission().push(&entry) }.is_ok() {
@@ -355,19 +440,19 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
                     Input::Closed(Error::Topic(error))
                 };
                 let _ = protocol.input(input);
+                self.shared.ready.borrow_mut().push(index);
                 return;
             }
         };
         let id = if operation.phase() == Phase::Prepared {
             operation.id()
         } else {
-            match operation.prepare() {
-                Some(id) => id,
-                None => {
-                    let _ = protocol.input(Input::Closed(Error::Capacity));
-                    return;
-                }
-            }
+            let Some(id) = operation.prepare() else {
+                let _ = protocol.input(Input::Closed(Error::Capacity));
+                self.shared.ready.borrow_mut().push(index);
+                return;
+            };
+            id
         };
         let buffers = &self.shared.buffers[index];
         if lane == Lane::CreditSend && offset == 0 {
@@ -384,6 +469,8 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         // SAFETY: protocol effects are within the fixed buffer's bounds. No
         // access or recycling is permitted until this operation's terminal CQE.
         let pointer = unsafe { buffers.pointer(lane).add(offset) };
+        // Every buffer length is bounded to u32 by Driver::new and Protocol::new.
+        #[allow(clippy::cast_possible_truncation)]
         let entry = if receive {
             opcode::Recv::new(fd, pointer, length as u32).build()
         } else {
@@ -421,7 +508,22 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
     fn wake(&self, index: usize) {
         let mut slots = self.shared.slots.borrow_mut();
         let slot = &mut slots[index];
-        let ready = slot.protocol.as_ref().is_some_and(|p| p.closed().is_some());
+        let work = slot.operations.iter().any(|op| op.cancellation().is_some())
+            || slot.protocol.as_ref().is_some_and(|p| {
+                Lane::ALL.into_iter().any(|lane| {
+                    matches!(
+                        slot.operations[lane as usize].phase(),
+                        Phase::Available | Phase::Prepared
+                    ) && matches!(
+                        p.effect(lane),
+                        Some(Effect::Receive { .. } | Effect::Transmit { .. })
+                    )
+                })
+            });
+        if work {
+            self.shared.ready.borrow_mut().push(index);
+        }
+        let ready = work || slot.protocol.as_ref().is_some_and(|p| p.closed().is_some());
         let wake = if ready { slot.waker.take() } else { None };
         drop(slots);
         if let Some(wake) = wake {
@@ -432,9 +534,10 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
 
 impl<G: Reservation, const LINKS: usize, const BYTES: usize> Drop for Driver<G, LINKS, BYTES> {
     fn drop(&mut self) {
-        for slot in self.shared.slots.borrow_mut().iter_mut() {
+        for (index, slot) in self.shared.slots.borrow_mut().iter_mut().enumerate() {
             if let Some(protocol) = &mut slot.protocol {
                 let _ = protocol.input(Input::Closed(Error::Closed));
+                self.shared.ready.borrow_mut().push(index);
             }
         }
         loop {
@@ -515,7 +618,9 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Frames for Handle<G
         // SAFETY: Provide has no active data operation; no other handle exists.
         let output = unsafe { &mut *self.shared.buffers[self.index].data.get() };
         let length = transport::encode_frame::<E>(sequence, payload, output)?;
-        protocol.input(Input::Provided { sequence, length })
+        protocol.input(Input::Provided { sequence, length })?;
+        self.shared.ready.borrow_mut().push(self.index);
+        Ok(())
     }
 
     fn poll_frame<E: WireCodec>(
@@ -542,7 +647,9 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Frames for Handle<G
 
     fn admitted(&mut self) -> Result<(), Error> {
         let mut slots = self.shared.slots.borrow_mut();
-        Self::status(&mut slots[self.index])?.input(Input::Admitted)
+        Self::status(&mut slots[self.index])?.input(Input::Admitted)?;
+        self.shared.ready.borrow_mut().push(self.index);
+        Ok(())
     }
 
     fn poll_endpoint<F: Future>(
@@ -575,6 +682,7 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Frames for Handle<G
         let mut slots = self.shared.slots.borrow_mut();
         if let Some(protocol) = &mut slots[self.index].protocol {
             let _ = protocol.input(Input::Closed(error));
+            self.shared.ready.borrow_mut().push(self.index);
         }
     }
 }

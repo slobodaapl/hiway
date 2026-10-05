@@ -534,6 +534,9 @@ where
     E::Payload: Copy,
 {
     /// Creates storage using the host's synchronization policy.
+    ///
+    /// # Panics
+    /// Panics if `CAP` is zero.
     pub fn with_lock(lock: M) -> Self {
         assert!(CAP > 0, "stream capacity must be greater than zero");
         Self {
@@ -616,10 +619,18 @@ where
         waker: &Waker,
         mut access: impl FnMut(&mut State<E::Payload, CAP, SUBS>) -> Poll<R>,
     ) -> Result<Poll<R>, ()> {
-        let mut result = self.try_with(&mut access).unwrap_or(Poll::Pending);
-        if result.is_pending() {
+        let mut result = Poll::Pending;
+        // Keep payloads out of the lock helper's return value.
+        let mut poll = |state: &mut State<E::Payload, CAP, SUBS>| match access(state) {
+            Poll::Ready(value) => {
+                result = Poll::Ready(value);
+                true
+            }
+            Poll::Pending => false,
+        };
+        if !self.try_with(&mut poll).unwrap_or(false) {
             self.register(id, interest, waker)?;
-            result = self.try_with(access).unwrap_or(Poll::Pending);
+            let _ = self.try_with(poll);
         }
         if result.is_ready() {
             self.cancel(id.take());
@@ -998,29 +1009,27 @@ where
         let this = self.get_mut();
         let value = this
             .payload
-            .take()
+            .as_ref()
             .expect("completed send was polled again");
-        let result = this
-            .stream
-            .poll_with(
-                &mut this.waiter,
-                Interest::Send,
-                context.waker(),
-                |state| match state.send_now(value) {
-                    Ok(()) => Poll::Ready(Ok(())),
-                    Err(TrySendError::Full(_)) => Poll::Pending,
-                    Err(TrySendError::Revoked(value)) => {
-                        Poll::Ready(Err(SendError::Revoked(value)))
-                    }
-                    Err(TrySendError::SequenceExhausted(value)) => {
-                        Poll::Ready(Err(SendError::SequenceExhausted(value)))
-                    }
-                    Err(error) => Poll::Ready(Err(SendError::Closed(error.into_inner()))),
-                },
-            )
-            .unwrap_or(Poll::Ready(Err(SendError::WaitersFull(value))));
-        if result.is_pending() {
-            this.payload = Some(value);
+        let result = match this.stream.poll_with(
+            &mut this.waiter,
+            Interest::Send,
+            context.waker(),
+            |state| match state.send_now(*value) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(TrySendError::Full(_)) => Poll::Pending,
+                Err(TrySendError::Revoked(value)) => Poll::Ready(Err(SendError::Revoked(value))),
+                Err(TrySendError::SequenceExhausted(value)) => {
+                    Poll::Ready(Err(SendError::SequenceExhausted(value)))
+                }
+                Err(error) => Poll::Ready(Err(SendError::Closed(error.into_inner()))),
+            },
+        ) {
+            Ok(result) => result,
+            Err(()) => Poll::Ready(Err(SendError::WaitersFull(*value))),
+        };
+        if result.is_ready() {
+            this.payload = None;
         }
         result
     }
@@ -1061,19 +1070,20 @@ where
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        this.receiver
-            .stream
-            .poll_with(
-                &mut this.waiter,
-                Interest::Receive,
-                context.waker(),
-                |state| match state.recv_now(this.receiver.key) {
-                    Ok(Some(item)) => Poll::Ready(Ok(item)),
-                    Err(error) => Poll::Ready(Err(error)),
-                    Ok(None) => Poll::Pending,
-                },
-            )
-            .unwrap_or(Poll::Ready(Err(ReceiveError::WaitersFull)))
+        match this.receiver.stream.poll_with(
+            &mut this.waiter,
+            Interest::Receive,
+            context.waker(),
+            |state| match state.recv_now(this.receiver.key) {
+                Ok(Some(item)) => Poll::Ready(Ok(item)),
+                Err(error) => Poll::Ready(Err(error)),
+                Ok(None) => Poll::Pending,
+            },
+        ) {
+            Ok(Poll::Ready(result)) => Poll::Ready(result),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(()) => Poll::Ready(Err(ReceiveError::WaitersFull)),
+        }
     }
 }
 

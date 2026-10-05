@@ -23,7 +23,7 @@ where
     P: EventReceiver<events::Broadcast>,
 {
     fn receive_broadcast(&mut self) -> Result<bool, ReceiveError> {
-        match self.port.recv_now::<events::Broadcast>()? {
+        match self.port.recv_now()? {
             Some(StreamItem::Data { value, .. }) => {
                 self.health = self.health.saturating_sub(*value);
                 Ok(true)

@@ -1311,6 +1311,115 @@ fn empty_receive_and_full_send_register_without_self_wake_loops() {
     assert_eq!(send_wakes.calls.load(Ordering::SeqCst), 1);
 }
 
+#[test]
+fn static_receive_releases_waiters_and_preserves_large_payloads() {
+    struct Large;
+    impl hiway::EventSpec for Large {
+        type Payload = [u8; 4096];
+        const ID: hiway::EventId = hiway::EventId::from_u128(1);
+    }
+    let stream = hiway::StaticStream::<Large, 1, 1, 1>::new();
+    let receiver = stream.subscribe(SubscriptionRole::Required).unwrap();
+    let notifications = Arc::new(WakeCounter {
+        calls: AtomicUsize::new(0),
+    });
+    let waker = Waker::from(Arc::clone(&notifications));
+    let mut receive = Box::pin(receiver.recv());
+    for _ in 0..2 {
+        assert!(poll_with(receive.as_mut(), &waker).is_pending());
+        assert_eq!(notifications.calls.load(Ordering::SeqCst), 0);
+    }
+    let mut excess = Box::pin(receiver.recv());
+    assert!(matches!(
+        poll_with(excess.as_mut(), &waker),
+        Poll::Ready(Err(hiway::ReceiveError::WaitersFull))
+    ));
+    let payload = core::array::from_fn(|i| u8::try_from(i % 251).unwrap());
+    stream.sender().send_now(payload).unwrap();
+    assert_eq!(notifications.calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        poll_with(receive.as_mut(), &waker),
+        Poll::Ready(Ok(StreamItem::Data { sequence: 0, value })) if *value == payload
+    ));
+    drop(receive);
+    let mut cancelled = Box::pin(receiver.recv());
+    assert!(poll_with(cancelled.as_mut(), &waker).is_pending());
+    drop(cancelled);
+    let replacement_notifications = Arc::new(WakeCounter {
+        calls: AtomicUsize::new(0),
+    });
+    let replacement_waker = Waker::from(Arc::clone(&replacement_notifications));
+    let mut replacement = Box::pin(receiver.recv());
+    assert!(poll_with(replacement.as_mut(), &replacement_waker).is_pending());
+    stream.sender().send_now(payload).unwrap();
+    assert_eq!(notifications.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement_notifications.calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        poll_with(replacement.as_mut(), &replacement_waker),
+        Poll::Ready(Ok(StreamItem::Data { sequence: 1, value })) if *value == payload
+    ));
+}
+
+#[test]
+fn static_send_preserves_pending_payloads_and_releases_waiters() {
+    struct Large;
+    impl hiway::EventSpec for Large {
+        type Payload = [u8; 4096];
+        const ID: hiway::EventId = hiway::EventId::from_u128(2);
+    }
+    let stream = hiway::StaticStream::<Large, 1, 1, 1>::new();
+    let receiver = stream.subscribe(SubscriptionRole::Required).unwrap();
+    let sender = stream.sender();
+    let payload = core::array::from_fn(|i| u8::try_from(i % 251).unwrap());
+    let notifications = Arc::new(WakeCounter {
+        calls: AtomicUsize::new(0),
+    });
+    let waker = Waker::from(Arc::clone(&notifications));
+    sender.send_now([0; 4096]).unwrap();
+    let mut send = Box::pin(sender.send(payload));
+    for _ in 0..2 {
+        assert!(poll_with(send.as_mut(), &waker).is_pending());
+        assert_eq!(notifications.calls.load(Ordering::SeqCst), 0);
+    }
+    let mut excess = Box::pin(sender.send([7; 4096]));
+    assert!(matches!(
+        poll_with(excess.as_mut(), &waker),
+        Poll::Ready(Err(SendError::WaitersFull(value))) if value == [7; 4096]
+    ));
+    assert!(matches!(
+        receiver.recv_now().unwrap(),
+        Some(StreamItem::Data { sequence: 0, value }) if *value == [0; 4096]
+    ));
+    assert_eq!(notifications.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(poll_with(send.as_mut(), &waker), Poll::Ready(Ok(())));
+    assert!(matches!(
+        receiver.recv_now().unwrap(),
+        Some(StreamItem::Data { sequence: 1, value }) if *value == payload
+    ));
+    sender.send_now([0; 4096]).unwrap();
+    let mut cancelled = Box::pin(sender.send(payload));
+    assert!(poll_with(cancelled.as_mut(), &waker).is_pending());
+    drop(cancelled);
+    let mut replacement = Box::pin(sender.send([9; 4096]));
+    assert!(poll_with(replacement.as_mut(), &waker).is_pending());
+    receiver.recv_now().unwrap();
+    assert_eq!(poll_with(replacement.as_mut(), &waker), Poll::Ready(Ok(())));
+    assert!(matches!(
+        receiver.recv_now().unwrap(),
+        Some(StreamItem::Data { sequence: 3, value }) if *value == [9; 4096]
+    ));
+    sender.send_now([0; 4096]).unwrap();
+    let mut revoked = Box::pin(sender.send(payload));
+    assert!(poll_with(revoked.as_mut(), &waker).is_pending());
+    notifications.calls.store(0, Ordering::SeqCst);
+    stream.close(CloseReason::Revoked);
+    assert_eq!(notifications.calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        poll_with(revoked.as_mut(), &waker),
+        Poll::Ready(Err(SendError::Revoked(value))) if value == payload
+    ));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn revocation_closes_subscriptions_and_rejects_new_publications() {
     let (_bus, grant) = setup_value(1);

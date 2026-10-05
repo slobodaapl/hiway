@@ -23,6 +23,9 @@ pub struct GrantAccess {
 impl Grant {
     /// Reserves two connections, one in-flight frame, one future waiter, and
     /// the backend's declared arena bytes from this grant's transport pool.
+    ///
+    /// # Errors
+    /// Returns authority rejection or `Capacity` when the grant cannot reserve the resources.
     pub fn reserve_transport<E: EventSpec>(
         &self,
         direction: Direction,

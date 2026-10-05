@@ -50,6 +50,7 @@ pub enum IoResult {
     Failed(i32),
 }
 
+#[derive(Clone, Copy)]
 pub enum Input<'a> {
     Accepted {
         lane: Lane,
@@ -82,6 +83,7 @@ enum Stage {
 
 /// Deterministic HWY1 protocol. Storage and execution remain outside the model.
 /// An effect stays pending until `Accepted`; acceptance is not completion.
+/// Backends must retire all completion notifications before reusing an `OpId`.
 pub struct Protocol {
     contract: Contract,
     direction: Direction,
@@ -98,6 +100,10 @@ pub struct Protocol {
 }
 
 impl Protocol {
+    /// Creates a protocol with a fixed frame-buffer capacity.
+    ///
+    /// # Errors
+    /// Returns `Capacity` if the buffer cannot hold a header or a wire-sized payload.
     pub fn new(contract: Contract, direction: Direction, capacity: usize) -> Result<Self, Error> {
         if capacity < HEADER_BYTES || capacity - HEADER_BYTES > u32::MAX as usize {
             return Err(Error::Capacity);
@@ -121,13 +127,16 @@ impl Protocol {
         })
     }
 
+    #[must_use]
     pub fn contract(&self) -> Contract {
         self.contract
     }
+    #[must_use]
     pub fn closed(&self) -> Option<Error> {
         self.closed
     }
 
+    #[must_use]
     pub fn effect(&self, lane: Lane) -> Option<Effect> {
         if let Some((target, _)) = self.active[lane as usize] {
             return self.closed.map(|_| Effect::Cancel { lane, target });
@@ -144,7 +153,12 @@ impl Protocol {
                     offset,
                     length: self.length - offset,
                 }),
-                Stage::Header | Stage::Payload => Some(Effect::Receive {
+                Stage::Header => Some(Effect::Receive {
+                    lane,
+                    offset,
+                    length: self.capacity - offset,
+                }),
+                Stage::Payload => Some(Effect::Receive {
                     lane,
                     offset,
                     length: self.length - offset,
@@ -173,14 +187,18 @@ impl Protocol {
         }
     }
 
+    #[must_use]
     pub fn credit(&self) -> [u8; CREDIT_BYTES] {
         let mut credit = [1; CREDIT_BYTES];
         credit[1..].copy_from_slice(&self.sequence.to_le_bytes());
         credit
     }
 
-    /// Stale or duplicate completions have no effect. Invalid current input
+    /// Completions without a matching active ID have no effect. Invalid current input
     /// closes the protocol; closure never discards outstanding operation IDs.
+    ///
+    /// # Errors
+    /// Returns framing, I/O, sequence, capacity or lifecycle errors from the input.
     pub fn input(&mut self, input: Input<'_>) -> Result<(), Error> {
         let result = self.transition(input);
         if let Err(error) = result {
@@ -225,9 +243,14 @@ impl Protocol {
                     IoResult::Bytes(0) => return Err(Error::Closed),
                     IoResult::Bytes(count) => count,
                 };
-                let requested = match effect {
-                    Effect::Receive { length, .. } | Effect::Transmit { length, .. } => length,
-                    _ => unreachable!(),
+                let (Effect::Receive {
+                    length: requested, ..
+                }
+                | Effect::Transmit {
+                    length: requested, ..
+                }) = effect
+                else {
+                    unreachable!()
                 };
                 if count > requested {
                     return Err(Error::Protocol);
@@ -266,15 +289,15 @@ impl Protocol {
     fn progress(&mut self, lane: Lane, buffer: &[u8]) -> Result<(), Error> {
         let offset = self.offsets[lane as usize];
         match lane {
-            Lane::Data if offset == self.length => match self.stage {
-                Stage::Sending => {
+            Lane::Data => match self.stage {
+                Stage::Sending if offset == self.length => {
                     self.stage = if self.credited {
                         Stage::Source
                     } else {
                         Stage::Credit
                     }
                 }
-                Stage::Header => {
+                Stage::Header if offset >= HEADER_BYTES => {
                     let header = buffer.get(..HEADER_BYTES).ok_or(Error::Protocol)?;
                     if header[..4] != *b"HWY1"
                         || header[4..20] != self.contract.event.as_u128().to_le_bytes()
@@ -290,19 +313,24 @@ impl Protocol {
                     if self.length > self.capacity {
                         return Err(Error::Capacity);
                     }
+                    // One frame may be in flight until admission returns credit.
+                    if offset > self.length {
+                        return Err(Error::Protocol);
+                    }
                     if self
                         .previous
                         .is_some_and(|last| last.checked_add(1) != Some(self.sequence))
                     {
                         return Err(Error::Protocol);
                     }
-                    self.stage = if length == 0 {
+                    self.stage = if offset == self.length {
                         Stage::Admission
                     } else {
                         Stage::Payload
                     };
                 }
-                Stage::Payload => self.stage = Stage::Admission,
+                Stage::Payload if offset == self.length => self.stage = Stage::Admission,
+                Stage::Header | Stage::Payload | Stage::Sending => {}
                 _ => return Err(Error::Protocol),
             },
             Lane::CreditSend if offset == CREDIT_BYTES => {
@@ -330,7 +358,7 @@ impl Protocol {
                     }
                 }
             }
-            _ => {}
+            Lane::CreditSend => {}
         }
         Ok(())
     }
