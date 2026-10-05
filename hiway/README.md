@@ -84,7 +84,7 @@ endpoint types. Components storing that port can use a type parameter, as
 `Worker<P>` does in the example.
 
 ```sh
-cargo run --example backends --features std
+cargo run -p hiway --example backends --features std
 ```
 
 ## Persisting application state
@@ -100,7 +100,7 @@ no grant, port or subscription cursor; loading it does not restore authority
 or replay position.
 
 ```sh
-cargo run --example persistence --features std
+cargo run -p hiway --example persistence --features std
 ```
 
 Serde and JSON are choices made by this example. The Hiway library does not

@@ -473,6 +473,7 @@ fn revocation_waits_for_descendant_admission_and_does_not_mint_credits() {
         )
         .unwrap();
     let operation = child.enter(EVENT, Rights::PUBLISH).unwrap();
+    let last_operation = child.enter(EVENT, Rights::PUBLISH).unwrap();
     let wake = Arc::new(WakeCount::default());
     let waker = wake.clone().into();
     let mut context = Context::from_waker(&waker);
@@ -493,6 +494,9 @@ fn revocation_waits_for_descendant_admission_and_does_not_mint_credits() {
         core::task::Poll::Ready(Err(TopicError::Capacity))
     );
     drop(operation);
+    assert!(revoke.as_mut().poll(&mut context).is_pending());
+    wake.0.store(0, Ordering::Relaxed);
+    drop(last_operation);
     assert!(wake.0.load(Ordering::Relaxed) > 0);
     assert_eq!(
         revoke.as_mut().poll(&mut context),

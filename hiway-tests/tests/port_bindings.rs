@@ -26,9 +26,9 @@ mod port_identifier {
         let receiver = Receiver::bind(&graph).unwrap();
 
         sender.publish_now_done(73).unwrap();
-        let received = receiver.recv_now_done().unwrap().unwrap();
+        let item = receiver.recv_now_done().unwrap().unwrap();
 
-        match received {
+        match item {
             hiway::StreamItem::Data { value, .. } => assert_eq!(*value, 73),
             hiway::StreamItem::Gap { .. } => panic!("unexpected gap"),
         }

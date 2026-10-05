@@ -686,39 +686,113 @@ fn revocation_cutoff_raced_with_admission_rejects_late_work() {
 }
 
 #[test]
-fn concurrent_child_reservations_and_release_conserve_parent_allowance() {
+fn transport_access_raced_with_ancestor_cutoff_cannot_admit_late_work() {
+    use hiway::transport::{Direction, Reservation};
+    use loom::sync::atomic::{AtomicBool, Ordering};
+
     model(|| {
         let fabric = DynamicFabric::new();
         fabric
-            .create_stream::<Value>(StreamConfig {
-                capacity: 1,
-                subscribers: 1,
-                waiters: 0,
-            })
+            .create_stream::<Value>(StreamConfig::default())
             .unwrap();
+        let permissions = [Permission::new::<Value>(Rights::PUBLISH)];
+        let limits = Limits {
+            streams: 1,
+            connections: 2,
+            retained_items: 1,
+            waiters: 1,
+            bytes: 8,
+            ..Limits::ZERO
+        };
         let parent = fabric
             .grant(
-                &[Permission::new::<Value>(Rights::OBSERVE)],
+                &permissions,
                 Limits {
-                    streams: 2,
                     grants: 1,
-                    subscriptions: 1,
-                    retained_items: 1,
-                    waiters: 1,
-                    connections: 1,
-                    bytes: 1,
+                    ..limits
                 },
             )
             .unwrap();
-        let allowance = Limits {
-            streams: 1,
-            grants: 0,
-            subscriptions: 1,
-            retained_items: 1,
-            waiters: 1,
-            connections: 1,
-            bytes: 1,
-        };
+        let child = parent.restrict(&permissions, limits).unwrap();
+        let reservation = Arc::new(
+            child
+                .reserve_transport::<Value>(Direction::Import, 8)
+                .unwrap(),
+        );
+        let admitted = Arc::new(AtomicBool::new(false));
+        let concurrent_reservation = reservation.clone();
+        let concurrent_admitted = admitted.clone();
+        let admission = thread::spawn(move || match concurrent_reservation.enter() {
+            Ok(access) => {
+                concurrent_admitted.store(true, Ordering::Release);
+                drop(access);
+            }
+            Err(TopicError::Revoked) => {}
+            Err(error) => panic!("unexpected transport access result: {error:?}"),
+        });
+        let mut revoke = Box::pin(parent.revoke());
+        let mut context = Context::from_waker(Waker::noop());
+        let first_poll = revoke.as_mut().poll(&mut context);
+        let at_cutoff = first_poll
+            .is_ready()
+            .then(|| admitted.load(Ordering::Acquire));
+        admission.join().unwrap();
+        if first_poll.is_pending() {
+            assert_eq!(revoke.as_mut().poll(&mut context), Poll::Ready(Ok(())));
+        } else {
+            assert_eq!(first_poll, Poll::Ready(Ok(())));
+        }
+        if let Some(at_cutoff) = at_cutoff {
+            assert_eq!(at_cutoff, admitted.load(Ordering::Acquire));
+        }
+        assert_eq!(reservation.enter().err(), Some(TopicError::Revoked));
+        assert_eq!(child.usage().bytes, 8);
+        drop(reservation);
+        assert_eq!(child.usage().bytes, 0);
+    });
+}
+
+fn child_reservation_setup() -> (DynamicFabric, Grant, Limits) {
+    let fabric = DynamicFabric::new();
+    fabric
+        .create_stream::<Value>(StreamConfig {
+            capacity: 1,
+            subscribers: 1,
+            waiters: 0,
+        })
+        .unwrap();
+    let parent = fabric
+        .grant(
+            &[Permission::new::<Value>(Rights::OBSERVE)],
+            Limits {
+                streams: 2,
+                grants: 1,
+                subscriptions: 1,
+                retained_items: 1,
+                waiters: 1,
+                connections: 1,
+                bytes: 1,
+            },
+        )
+        .unwrap();
+    let allowance = Limits {
+        streams: 1,
+        grants: 0,
+        subscriptions: 1,
+        retained_items: 1,
+        waiters: 1,
+        connections: 1,
+        bytes: 1,
+    };
+    (fabric, parent, allowance)
+}
+
+// Joined contention and sequential restriction establish the same child state.
+// Separate models avoid multiplying independent schedules at that boundary.
+#[test]
+fn concurrent_child_reservations_conserve_parent_allowance() {
+    model(|| {
+        let (_fabric, parent, allowance) = child_reservation_setup();
         let first_parent = parent.clone();
         let second_parent = parent.clone();
         let first = thread::spawn(move || {
@@ -739,6 +813,31 @@ fn concurrent_child_reservations_and_release_conserve_parent_allowance() {
             ..allowance
         };
         assert_eq!(parent.usage(), expected);
+        assert_eq!(child.limits(), allowance);
+        assert_eq!(child.usage(), Limits::ZERO);
+        assert!(!parent.is_revoked());
+        assert!(!child.is_revoked());
+        drop(child);
+        assert_eq!(parent.usage(), Limits::ZERO);
+    });
+}
+
+#[test]
+fn child_release_and_reservation_conserve_parent_allowance() {
+    model(|| {
+        let (_fabric, parent, allowance) = child_reservation_setup();
+        let child = parent
+            .restrict(&[Permission::new::<Value>(Rights::OBSERVE)], allowance)
+            .unwrap();
+        let expected = Limits {
+            grants: 1,
+            ..allowance
+        };
+        assert_eq!(parent.usage(), expected);
+        assert_eq!(child.limits(), allowance);
+        assert_eq!(child.usage(), Limits::ZERO);
+        assert!(!parent.is_revoked());
+        assert!(!child.is_revoked());
 
         let contender = parent.clone();
         let release = thread::spawn(move || drop(child));

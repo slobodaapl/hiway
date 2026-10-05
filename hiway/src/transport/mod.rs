@@ -54,6 +54,7 @@ pub struct Contract {
     pub revision: SchemaRevision,
 }
 impl Contract {
+    #[must_use]
     pub const fn of<E: EventSpec>() -> Self {
         Self {
             event: E::ID,
@@ -70,12 +71,20 @@ pub trait Reservation {
     type Access<'a>
     where
         Self: 'a;
+    /// Checks the contract, direction and reserved storage size.
+    ///
+    /// # Errors
+    /// Returns the adapter's authority or resource rejection.
     fn check(
         &self,
         contract: Contract,
         direction: Direction,
         bytes: usize,
     ) -> Result<(), TopicError>;
+    /// Enters authorized work until the returned guard is dropped.
+    ///
+    /// # Errors
+    /// Returns the adapter's authority rejection, including revocation.
     fn enter(&self) -> Result<Self::Access<'_>, TopicError>;
     fn is_revoked(&self) -> bool;
 }
@@ -98,9 +107,17 @@ impl Reservation for () {
 /// closing record on drop; dropping a future does not reclaim submitted I/O.
 pub trait Frames {
     fn poll_source(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>>;
+    /// Provides the next export frame.
+    ///
+    /// # Errors
+    /// Returns encoding, capacity or lifecycle rejection.
     fn provide<E: WireCodec>(&mut self, sequence: u64, payload: &E::Payload) -> Result<(), Error>;
     fn poll_frame<E: WireCodec>(&mut self, cx: &mut Context<'_>)
         -> Poll<Result<E::Payload, Error>>;
+    /// Records local admission before credit can be sent.
+    ///
+    /// # Errors
+    /// Returns protocol or lifecycle rejection.
     fn admitted(&mut self) -> Result<(), Error>;
     /// Polls one endpoint operation under authority, releasing access before
     /// returning, including when the operation parks.
@@ -112,12 +129,10 @@ pub trait Frames {
     fn close(&mut self, error: Error);
 }
 
-async fn until_closed<T: Frames, F: Future>(io: &mut T, future: F) -> Result<F::Output, Error> {
-    let mut future = pin!(future);
-    poll_fn(|cx| io.poll_endpoint(cx, future.as_mut())).await
-}
-
 /// Exports through any typed receiver, without boxing its receive future.
+///
+/// # Errors
+/// Returns receiver, framing, I/O, gap or lifecycle failures and closes the link.
 pub async fn export<E: WireCodec, R: EventReceiver<E>, T: Frames>(
     receiver: R,
     mut io: T,
@@ -125,9 +140,11 @@ pub async fn export<E: WireCodec, R: EventReceiver<E>, T: Frames>(
     let result = async {
         loop {
             poll_fn(|cx| io.poll_source(cx)).await?;
-            let item = until_closed(&mut io, receiver.event_recv())
-                .await?
-                .map_err(Error::Receive)?;
+            let item = {
+                let mut receive = pin!(async { receiver.event_recv().await });
+                poll_fn(|cx| io.poll_endpoint(cx, receive.as_mut())).await?
+            }
+            .map_err(Error::Receive)?;
             match item {
                 StreamItem::Data { sequence, value } => io.provide::<E>(sequence, &value)?,
                 StreamItem::Gap { from, to } => return Err(Error::Gap { from, to }),
@@ -142,6 +159,9 @@ pub async fn export<E: WireCodec, R: EventReceiver<E>, T: Frames>(
 }
 
 /// Credit follows successful local admission, including when admission parks.
+///
+/// # Errors
+/// Returns admission, framing, I/O or lifecycle failures and closes the link.
 pub async fn import<E: WireCodec, S: EventSender<E>, T: Frames>(
     sender: S,
     mut io: T,
@@ -149,9 +169,11 @@ pub async fn import<E: WireCodec, S: EventSender<E>, T: Frames>(
     let result = async {
         loop {
             let payload = poll_fn(|cx| io.poll_frame::<E>(cx)).await?;
-            until_closed(&mut io, sender.send(payload))
-                .await?
-                .map_err(|error| Error::Send(error.map(|_| ())))?;
+            {
+                let mut send = pin!(async { sender.send(payload).await });
+                poll_fn(|cx| io.poll_endpoint(cx, send.as_mut())).await?
+            }
+            .map_err(|error| Error::Send(error.map(|_| ())))?;
             io.admitted()?;
         }
     }
@@ -162,6 +184,10 @@ pub async fn import<E: WireCodec, S: EventSender<E>, T: Frames>(
     result
 }
 
+/// Encodes a payload and its HWY1 header into caller-owned storage.
+///
+/// # Errors
+/// Returns `Capacity` if the frame does not fit, or `Wire` if payload encoding fails.
 pub fn encode_frame<E: WireCodec>(
     sequence: u64,
     payload: &E::Payload,
@@ -169,9 +195,10 @@ pub fn encode_frame<E: WireCodec>(
 ) -> Result<usize, Error> {
     let length = E::encoded_len(payload);
     let total = HEADER_BYTES.checked_add(length).ok_or(Error::Capacity)?;
-    if total > output.len() || length > u32::MAX as usize {
+    if total > output.len() {
         return Err(Error::Capacity);
     }
+    let wire_length = u32::try_from(length).map_err(|_| Error::Capacity)?;
     if E::encode(payload, &mut output[HEADER_BYTES..total]).map_err(Error::Wire)? != length {
         return Err(Error::Wire(WireError::InvalidPayload));
     }
@@ -180,6 +207,6 @@ pub fn encode_frame<E: WireCodec>(
     output[20..22].copy_from_slice(&E::WIRE_MAJOR.0.to_le_bytes());
     output[22..26].copy_from_slice(&E::SCHEMA_REVISION.0.to_le_bytes());
     output[26..34].copy_from_slice(&sequence.to_le_bytes());
-    output[34..38].copy_from_slice(&(length as u32).to_le_bytes());
+    output[34..38].copy_from_slice(&wire_length.to_le_bytes());
     Ok(total)
 }

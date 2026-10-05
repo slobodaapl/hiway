@@ -1,6 +1,6 @@
 //! Completion ownership, independent of the submission mechanism.
 
-/// A slot and its nonwrapping reuse generation.
+/// A slot and its wrapping reuse generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpId {
     pub slot: u32,
@@ -25,6 +25,7 @@ enum Cancellation {
 
 /// One fixed operation slot. Cancellation completion never stands in for
 /// the original operation's terminal completion.
+/// Backends must retire completion notifications before an ID is reused.
 pub struct Operation {
     id: OpId,
     phase: Phase,
@@ -32,6 +33,7 @@ pub struct Operation {
 }
 
 impl Operation {
+    #[must_use]
     pub const fn new(slot: u32) -> Self {
         Self {
             id: OpId {
@@ -43,19 +45,21 @@ impl Operation {
         }
     }
 
+    #[must_use]
     pub fn phase(&self) -> Phase {
         self.phase
     }
+    #[must_use]
     pub fn id(&self) -> OpId {
         self.id
     }
 
-    /// Returns `None` when occupied or when the generation space is exhausted.
+    /// Returns `None` when occupied. Generations wrap only after reclamation.
     pub fn prepare(&mut self) -> Option<OpId> {
         if self.phase != Phase::Available {
             return None;
         }
-        self.id.generation = self.id.generation.checked_add(1)?;
+        self.id.generation = self.id.generation.wrapping_add(1);
         self.phase = Phase::Prepared;
         Some(self.id)
     }
@@ -79,6 +83,7 @@ impl Operation {
         }
     }
 
+    #[must_use]
     pub fn cancellation(&self) -> Option<OpId> {
         (self.cancellation == Cancellation::Requested).then_some(self.id)
     }
@@ -118,5 +123,99 @@ impl Operation {
         self.phase = Phase::Available;
         self.cancellation = Cancellation::None;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn near_wrap() -> Operation {
+        Operation {
+            id: OpId {
+                slot: 7,
+                generation: u32::MAX - 1,
+            },
+            phase: Phase::Available,
+            cancellation: Cancellation::None,
+        }
+    }
+
+    #[test]
+    fn generation_reuse_requires_original_and_cancel_retirement() {
+        for cancel_first in [false, true] {
+            let mut operation = near_wrap();
+            let last = operation.prepare().unwrap();
+            assert_eq!(last.generation, u32::MAX);
+            assert!(operation.prepare().is_none());
+            assert!(operation.accepted(last));
+            operation.cancel();
+            assert!(operation.cancel_accepted(last));
+            assert!(operation.prepare().is_none());
+            if cancel_first {
+                assert!(operation.cancel_completed(last));
+            } else {
+                assert!(operation.completed(last));
+            }
+            assert!(!operation.reclaim());
+            assert!(operation.prepare().is_none());
+            if cancel_first {
+                assert!(operation.completed(last));
+            } else {
+                assert!(operation.cancel_completed(last));
+            }
+            assert!(operation.prepare().is_none());
+            assert!(operation.reclaim());
+
+            let next = operation.prepare().unwrap();
+            assert_eq!(
+                next,
+                OpId {
+                    slot: 7,
+                    generation: 0
+                }
+            );
+            assert!(operation.accepted(next));
+            operation.cancel();
+            assert!(operation.cancel_accepted(next));
+            assert!(!operation.completed(last));
+            assert!(!operation.cancel_completed(last));
+            assert!(!operation.reclaim());
+            assert!(operation.completed(next));
+            assert!(operation.cancel_completed(next));
+            assert!(operation.reclaim());
+            assert_eq!(operation.prepare().unwrap().generation, 1);
+        }
+    }
+
+    #[test]
+    fn completed_or_abandoned_last_generation_remains_reusable() {
+        for accepted in [false, true] {
+            let mut operation = near_wrap();
+            let last = operation.prepare().unwrap();
+            if accepted {
+                assert!(operation.accepted(last));
+                operation.cancel();
+                assert_eq!(operation.cancellation(), Some(last));
+                assert!(operation.completed(last));
+                assert_eq!(operation.cancellation(), None);
+            } else {
+                operation.cancel();
+            }
+            assert!(operation.reclaim());
+            let next = operation.prepare().unwrap();
+            assert_eq!(
+                next,
+                OpId {
+                    slot: 7,
+                    generation: 0
+                }
+            );
+            assert!(!operation.accepted(last));
+            assert!(operation.accepted(next));
+            assert!(!operation.completed(last));
+            assert!(operation.completed(next));
+            assert!(operation.reclaim());
+        }
     }
 }

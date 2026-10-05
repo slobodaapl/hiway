@@ -39,9 +39,11 @@ jobs:
           hiway_version="$(jq -r '.packages[] | select(.name == "hiway") | .version' <<<"$metadata")"
           macro_version="$(jq -r '.packages[] | select(.name == "hiway-macros") | .version' <<<"$metadata")"
           macro_requirement="$(jq -r '.packages[] | select(.name == "hiway") | .dependencies[] | select(.name == "hiway-macros") | .req' <<<"$metadata")"
+          uring_requirement="$(jq -r '.packages[] | select(.name == "hiway-uring") | .dependencies[] | select(.name == "hiway") | .req' <<<"$metadata")"
 
           [[ "$GITHUB_REF_NAME" == "v$hiway_version" ]]
           [[ "$macro_requirement" == "=$macro_version" ]]
+          [[ "$uring_requirement" == "=$hiway_version" ]]
 
           response_file="$RUNNER_TEMP/hiway-macros.json"
           status="$(curl --silent --show-error --header 'User-Agent: hiway-release' --output "$response_file" --write-out '%{http_code}' "https://crates.io/api/v1/crates/hiway-macros/$macro_version")"
@@ -113,6 +115,23 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo +1.96.1 publish -p hiway --locked
+
+      - name: Validate backend dependency resolution
+        shell: bash
+        run: |
+          for attempt in $(seq 1 30); do
+            if cargo +1.96.1 package -p hiway-uring --locked --no-verify >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 4
+          done
+          echo "hiway-uring could not resolve its published hiway dependency" >&2
+          exit 1
+
+      - name: Publish hiway-uring
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo +1.96.1 publish -p hiway-uring --locked
 
   attest:
     needs:

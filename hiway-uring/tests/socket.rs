@@ -126,14 +126,199 @@ fn sockets_admit_and_cancel_without_transport_allocations() {
     revocation_retains_outstanding_charges();
     forgetting_a_future_does_not_abandon_kernel_storage();
     failed_links_reclaim_and_reuse_the_slot();
+    active_links_survive_middle_removal_and_reuse();
+    completion_wake_panic_does_not_lose_delivery_or_cleanup();
     callback_panic_retains_kernel_storage();
 }
 
+fn completion_wake_panic_does_not_lose_delivery_or_cleanup() {
+    struct PanicOnce(AtomicBool);
+    impl Wake for PanicOnce {
+        fn wake(self: Arc<Self>) {
+            assert!(
+                self.0.swap(true, Ordering::SeqCst),
+                "completion wake failed"
+            );
+        }
+    }
+    let mut driver = Driver::<Charge, 2, 64>::new(8).unwrap();
+    let first = StaticStream::<Number, 1>::new();
+    let second = StaticStream::<Number, 1>::new();
+    let receivers = [
+        first.subscribe(SubscriptionRole::Required).unwrap(),
+        second.subscribe(SubscriptionRole::Required).unwrap(),
+    ];
+    let (mut first_peer, first_data) = UnixStream::pair().unwrap();
+    let (mut second_peer, second_data) = UnixStream::pair().unwrap();
+    let (_first_credit, first_control) = UnixStream::pair().unwrap();
+    let (_second_credit, second_control) = UnixStream::pair().unwrap();
+    let charges = Rc::new(Cell::new(2));
+    let panic_once = Arc::new(PanicOnce(AtomicBool::new(false)));
+    let waker = Waker::from(panic_once.clone());
+    let mut cx = Context::from_waker(&waker);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    {
+        let mut first = pin!(driver
+            .import(
+                first.sender(),
+                first_data,
+                first_control,
+                Charge(charges.clone())
+            )
+            .unwrap());
+        let mut second = pin!(driver
+            .import(
+                second.sender(),
+                second_data,
+                second_control,
+                Charge(charges.clone())
+            )
+            .unwrap());
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        driver.advance().unwrap();
+        for (peer, value) in [(&mut first_peer, 73), (&mut second_peer, 91)] {
+            let mut frame = [0; hiway::transport::HEADER_BYTES + 8];
+            hiway::transport::encode_frame::<Number>(0, &value, &mut frame).unwrap();
+            peer.write_all(&frame).unwrap();
+        }
+        loop {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                driver.advance().unwrap()
+            }));
+            if result.is_err() {
+                assert!(panic_once.0.load(Ordering::SeqCst));
+                break;
+            }
+            assert!(Instant::now() < deadline, "completion did not wake");
+            std::thread::yield_now();
+        }
+        let mut delivered = [None; 2];
+        while delivered.iter().any(Option::is_none) {
+            assert!(first.as_mut().poll(&mut cx).is_pending());
+            assert!(second.as_mut().poll(&mut cx).is_pending());
+            driver.advance().unwrap();
+            for (index, receiver) in receivers.iter().enumerate() {
+                if let Some(StreamItem::Data { value, .. }) = receiver.recv_now().unwrap() {
+                    assert!(delivered[index].replace(*value).is_none());
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "delivery was lost after wake panic"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(delivered, [Some(73), Some(91)]);
+    }
+    while driver.active_links() != 0 {
+        driver.advance().unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "cleanup was lost after wake panic"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(charges.get(), 0);
+}
+
+fn active_links_survive_middle_removal_and_reuse() {
+    let mut driver = Driver::<Revocable, 4, 64>::new(2).unwrap();
+    let destinations: [_; 4] = std::array::from_fn(|_| StaticStream::<Number, 1>::new());
+    let mut sockets: [_; 6] = std::array::from_fn(|_| {
+        let (peer_data, data) = UnixStream::pair().unwrap();
+        let (peer_control, control) = UnixStream::pair().unwrap();
+        ((peer_data, peer_control), Some((data, control)))
+    });
+    let revoked: [_; 4] = std::array::from_fn(|_| Rc::new(Cell::new(false)));
+    let charges = Rc::new(Cell::new(4));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let region = Region::new(ALLOCATOR);
+    let mut links: [_; 4] = std::array::from_fn(|index| {
+        let (data, control) = sockets[index].1.take().unwrap();
+        Some(
+            driver
+                .import(
+                    destinations[index].sender(),
+                    data,
+                    control,
+                    Revocable {
+                        _charge: Charge(charges.clone()),
+                        revoked: revoked[index].clone(),
+                    },
+                )
+                .unwrap(),
+        )
+    });
+    driver.advance().unwrap();
+    assert_eq!(driver.active_links(), 4);
+    for (removed, remaining) in [(1, 3), (3, 2)] {
+        drop(links[removed].take());
+        while driver.active_links() != remaining {
+            driver.advance().unwrap();
+            assert!(Instant::now() < deadline, "link was not reclaimed");
+            std::thread::yield_now();
+        }
+        assert_eq!(charges.get(), remaining);
+    }
+    revoked[2].set(true);
+    while charges.get() != 1 {
+        driver.advance().unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "revoked link beyond a vacant slot was missed"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(driver.active_links(), 2);
+    for (index, socket) in [(1, 4), (3, 5)] {
+        let (data, control) = sockets[socket].1.take().unwrap();
+        charges.set(charges.get() + 1);
+        links[index] = Some(
+            driver
+                .import(
+                    destinations[index].sender(),
+                    data,
+                    control,
+                    Revocable {
+                        _charge: Charge(charges.clone()),
+                        revoked: revoked[index].clone(),
+                    },
+                )
+                .unwrap(),
+        );
+    }
+    assert_eq!(driver.active_links(), 4);
+    driver.advance().unwrap();
+    for revoked in &revoked {
+        revoked.set(true);
+    }
+    while charges.get() != 0 {
+        driver.advance().unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "unpolled revocation was not reclaimed"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(driver.active_links(), 4);
+    drop(links);
+    while driver.active_links() != 0 {
+        driver.advance().unwrap();
+        assert!(Instant::now() < deadline, "closed links were not removed");
+    }
+    let allocations = region.change();
+    assert_eq!(allocations.allocations, 0);
+    assert_eq!(allocations.reallocations, 0);
+}
+
 fn saturated_idle_receives_do_not_strand_submission() {
-    let mut driver = Driver::<(), 8, 64>::new(2).unwrap();
     use std::os::fd::{AsFd, FromRawFd};
+    let mut driver = Driver::<(), 8, 64>::new(2).unwrap();
+    // SAFETY: the constant eventfd arguments contain no borrowed memory.
     let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
     assert!(fd >= 0);
+    // SAFETY: this successful descriptor has no other owner.
     let mut completions = unsafe { std::fs::File::from_raw_fd(fd) };
     driver.register_eventfd(completions.as_fd()).unwrap();
     let destination = StaticStream::<Number, 1>::new();
@@ -355,15 +540,15 @@ fn admission_credit_waits_for_destination() {
         matches!(receiver.recv_now().unwrap(), Some(StreamItem::Data { value, .. }) if *value == 73)
     );
     credit.set_nonblocking(true).unwrap();
-    let mut received = 0;
-    while received != ack.len() {
+    let mut bytes_read = 0;
+    while bytes_read != ack.len() {
         driver.advance().unwrap();
         if signal.0.swap(false, Ordering::SeqCst) {
             assert!(import.as_mut().poll(&mut cx).is_pending());
         }
-        match credit.read(&mut ack[received..]) {
+        match credit.read(&mut ack[bytes_read..]) {
             Ok(0) => panic!("control socket closed"),
-            Ok(count) => received += count,
+            Ok(count) => bytes_read += count,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => panic!("{error}"),
         }

@@ -34,12 +34,19 @@ jobs:
           metadata="$(cargo +1.96.1 metadata --no-deps --format-version 1)"
           hiway_version="$(jq -r '.packages[] | select(.name == "hiway") | .version' <<<"$metadata")"
           macro_version="$(jq -r '.packages[] | select(.name == "hiway-macros") | .version' <<<"$metadata")"
+          uring_version="$(jq -r '.packages[] | select(.name == "hiway-uring") | .version' <<<"$metadata")"
 
           cargo +1.96.1 package -p hiway --locked --no-verify
           hiway_crate="target/package/hiway-${hiway_version}.crate"
           [[ -f "$hiway_crate" ]]
           echo "hiway-crate=$hiway_crate" >> "$GITHUB_OUTPUT"
           echo "hiway-sbom=target/package/hiway.cdx.json" >> "$GITHUB_OUTPUT"
+
+          cargo +1.96.1 package -p hiway-uring --locked --no-verify
+          uring_crate="target/package/hiway-uring-${uring_version}.crate"
+          [[ -f "$uring_crate" ]]
+          echo "uring-crate=$uring_crate" >> "$GITHUB_OUTPUT"
+          echo "uring-sbom=target/package/hiway-uring.cdx.json" >> "$GITHUB_OUTPUT"
 
           if [[ "${{ inputs.include-macro }}" == "true" ]]; then
             cargo +1.96.1 package -p hiway-macros --locked --no-verify
@@ -91,6 +98,26 @@ jobs:
         with:
           subject-path: ${{ steps.pkgs.outputs.macro-crate }}
           sbom-path: ${{ steps.pkgs.outputs.macro-sbom }}
+
+      - name: Generate hiway-uring SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26
+        with:
+          file: ${{ steps.pkgs.outputs.uring-crate }}
+          format: cyclonedx-json
+          output-file: ${{ steps.pkgs.outputs.uring-sbom }}
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attest hiway-uring provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ steps.pkgs.outputs.uring-crate }}
+
+      - name: Attest hiway-uring SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ steps.pkgs.outputs.uring-crate }}
+          sbom-path: ${{ steps.pkgs.outputs.uring-sbom }}
 
       - name: Upload release evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

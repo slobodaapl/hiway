@@ -1,5 +1,6 @@
 #[cfg(target_os = "linux")]
 fn run<const BYTES: usize>(entries: u32) {
+    const COUNT: u32 = 10_000;
     use hiway::{
         EventId, EventSpec, SchemaRevision, StaticStream, StreamItem, SubscriptionRole, WireCodec,
         WireError,
@@ -69,11 +70,10 @@ fn run<const BYTES: usize>(entries: u32) {
     let mut cx = Context::from_waker(Waker::noop());
     let mut delivered = [0_u64; 2];
     let mut sent = [0_u64; 2];
-    const COUNT: u64 = 10_000;
     let start = Instant::now();
-    while delivered != [COUNT; 2] {
+    while delivered != [u64::from(COUNT); 2] {
         for (index, source) in [&source_a, &source_b].into_iter().enumerate() {
-            if sent[index] < COUNT && source.sender().send_now(sent[index]).is_ok() {
+            if sent[index] < u64::from(COUNT) && source.sender().send_now(sent[index]).is_ok() {
                 sent[index] += 1;
             }
         }
@@ -91,7 +91,7 @@ fn run<const BYTES: usize>(entries: u32) {
     }
     let elapsed = start.elapsed();
     println!("entries={entries} frame_bytes={BYTES} links=4 frames={} elapsed_us={} frames_per_second={:.0}",
-        COUNT * 2, elapsed.as_micros(), (COUNT * 2) as f64 / elapsed.as_secs_f64());
+        COUNT * 2, elapsed.as_micros(), f64::from(COUNT * 2) / elapsed.as_secs_f64());
 }
 
 fn main() {

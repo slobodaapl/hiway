@@ -98,8 +98,7 @@ fn conditional_attribute(meta: &syn::Meta) -> Result<Option<TokenStream2>> {
                     input.parse::<syn::Meta>()?.to_token_stream()
                 };
                 input.parse::<Token![,]>()?;
-                let attributes =
-                    input.parse_terminated(|input| input.parse::<syn::Meta>(), Token![,])?;
+                let attributes = input.parse_terminated(syn::Meta::parse, Token![,])?;
                 Ok((predicate, attributes))
             })?;
 
@@ -156,6 +155,8 @@ fn explicit_event_id(attributes: &[syn::Attribute]) -> Result<Option<syn::LitStr
     Ok(id)
 }
 
+// Keep variant validation and its generated items together.
+#[allow(clippy::too_many_lines)]
 fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2> {
     if !item.generics.params.is_empty() {
         return Err(Error::new_spanned(
@@ -575,6 +576,8 @@ fn graph_binding(
     }
 }
 
+// Keep endpoint selection and the corresponding binding expansion together.
+#[allow(clippy::too_many_lines)]
 fn expand_port(arguments: &PortArgs, item: &ItemStruct) -> Result<TokenStream2> {
     if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
         return Err(Error::new_spanned(

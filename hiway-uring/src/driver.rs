@@ -15,10 +15,10 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-const CANCEL: u64 = 1 << 31;
+const CANCEL: u32 = 1 << 31;
 
 fn token(id: OpId) -> u64 {
-    ((id.generation as u64) << 32) | id.slot as u64
+    (u64::from(id.generation) << 32) | u64::from(id.slot)
 }
 
 struct Buffers<const BYTES: usize> {
@@ -58,6 +58,8 @@ struct Slot<G> {
     waker: Option<Waker>,
 }
 impl<G> Slot<G> {
+    // Driver::new bounds operation indices below the cancellation bit.
+    #[allow(clippy::cast_possible_truncation)]
     fn new(index: usize) -> Self {
         Self {
             protocol: None,
@@ -130,6 +132,9 @@ pub struct Driver<G: Reservation = (), const LINKS: usize = 8, const BYTES: usiz
 impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BYTES> {
     /// `entries` includes one submission slot reserved for cancellation.
     /// Buffer bounds include the 38-byte HWY1 header.
+    ///
+    /// # Errors
+    /// Returns invalid capacity, arena allocation or ring setup errors.
     pub fn new(entries: u32) -> io::Result<Self> {
         if LINKS == 0
             || LINKS > (CANCEL as usize) / 3
@@ -145,7 +150,17 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
             .and_then(|count| u32::try_from(count).ok())
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
         // Every original operation and its cancellation may complete together.
-        let ring = IoUring::builder().setup_cqsize(cq_entries).build(entries)?;
+        let ring = IoUring::builder()
+            .setup_cqsize(cq_entries)
+            .setup_coop_taskrun()
+            .build(entries)
+            .or_else(|error| {
+                if error.kind() == io::ErrorKind::InvalidInput {
+                    IoUring::builder().setup_cqsize(cq_entries).build(entries)
+                } else {
+                    Err(error)
+                }
+            })?;
         let mut buffers = Vec::new();
         buffers
             .try_reserve_exact(LINKS)
@@ -165,6 +180,7 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
     }
 
     /// Per-link arena bytes to reserve in an accounting adapter.
+    #[must_use]
     pub const fn reservation_bytes() -> usize {
         std::mem::size_of::<Slot<G>>()
             + std::mem::size_of::<Buffers<BYTES>>()
@@ -201,6 +217,10 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         })
     }
 
+    /// Attaches an authorized export using the caller's receiver and sockets.
+    ///
+    /// # Errors
+    /// Returns authority, reservation, buffer or link-capacity rejection.
     pub fn export<E: WireCodec, R: EventReceiver<E>>(
         &self,
         receiver: R,
@@ -212,6 +232,10 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         Ok(transport::export(receiver, io))
     }
 
+    /// Attaches an authorized import using the caller's sender and sockets.
+    ///
+    /// # Errors
+    /// Returns authority, reservation, buffer or link-capacity rejection.
     pub fn import<E: WireCodec, S: EventSender<E>>(
         &self,
         sender: S,
@@ -225,6 +249,9 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
 
     /// One bounded pass over completions, authority and ready links, followed by nonwaiting
     /// submission. Independent links batch into the same ring.
+    ///
+    /// # Errors
+    /// Returns submission errors; queued operations retain their storage.
     pub fn advance(&mut self) -> io::Result<usize> {
         let budget = self.ring.params().cq_entries();
         let mut completed = 0;
@@ -278,14 +305,19 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
             self.reclaim(index);
             self.wake(index);
         }
-        self.ring.submit()?;
+        if self.pending_completions != 0 {
+            self.ring.submit()?;
+        }
         Ok(completed)
     }
 
     /// Explicit host wait. Do not call this from a future's `poll` method.
     /// Local endpoint readiness still belongs to the host's executor/waker.
+    ///
+    /// # Errors
+    /// Returns the kernel's submission or wait error.
     pub fn wait(&mut self) -> io::Result<usize> {
-        if self.pending_completions == 0 {
+        if self.pending_completions == 0 || !self.ring.completion().is_empty() {
             return Ok(0);
         }
         self.ring.submit_and_wait(1)
@@ -293,10 +325,14 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
 
     /// Connects CQ notification to a host-owned eventfd/reactor. Register before
     /// entering the host wait; local endpoint wakes remain a separate source.
+    ///
+    /// # Errors
+    /// Returns the kernel's eventfd registration error.
     pub fn register_eventfd(&self, eventfd: BorrowedFd<'_>) -> io::Result<()> {
         self.ring.submitter().register_eventfd(eventfd.as_raw_fd())
     }
 
+    #[must_use]
     pub fn active_links(&self) -> usize {
         self.shared
             .slots
@@ -306,8 +342,11 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
             .count()
     }
 
+    // Tokens deliberately unpack their two u32 words. The negative-result
+    // branch handles errors before a completion length is converted to usize.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn complete(&mut self, user_data: u64, result: i32) {
-        let index = (user_data as u32 & !(CANCEL as u32)) as usize;
+        let index = (user_data as u32 & !CANCEL) as usize;
         if index / 3 >= LINKS {
             return;
         }
@@ -319,7 +358,7 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         let mut slots = self.shared.slots.borrow_mut();
         let slot = &mut slots[index / 3];
         let operation = &mut slot.operations[lane as usize];
-        if user_data & CANCEL != 0 {
+        if user_data & u64::from(CANCEL) != 0 {
             operation.cancel_completed(id);
         } else if operation.completed(id) {
             if let Some(protocol) = &mut slot.protocol {
@@ -360,7 +399,7 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         };
         let entry = opcode::AsyncCancel::new(token(id))
             .build()
-            .user_data(token(id) | CANCEL);
+            .user_data(token(id) | u64::from(CANCEL));
         // SAFETY: cancellation owns no borrowed memory. Its CQE has a separate
         // tag, and the original buffer stays retained through both completions.
         if unsafe { self.ring.submission().push(&entry) }.is_ok() {
@@ -408,14 +447,12 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         let id = if operation.phase() == Phase::Prepared {
             operation.id()
         } else {
-            match operation.prepare() {
-                Some(id) => id,
-                None => {
-                    let _ = protocol.input(Input::Closed(Error::Capacity));
-                    self.shared.ready.borrow_mut().push(index);
-                    return;
-                }
-            }
+            let Some(id) = operation.prepare() else {
+                let _ = protocol.input(Input::Closed(Error::Capacity));
+                self.shared.ready.borrow_mut().push(index);
+                return;
+            };
+            id
         };
         let buffers = &self.shared.buffers[index];
         if lane == Lane::CreditSend && offset == 0 {
@@ -432,6 +469,8 @@ impl<G: Reservation, const LINKS: usize, const BYTES: usize> Driver<G, LINKS, BY
         // SAFETY: protocol effects are within the fixed buffer's bounds. No
         // access or recycling is permitted until this operation's terminal CQE.
         let pointer = unsafe { buffers.pointer(lane).add(offset) };
+        // Every buffer length is bounded to u32 by Driver::new and Protocol::new.
+        #[allow(clippy::cast_possible_truncation)]
         let entry = if receive {
             opcode::Recv::new(fd, pointer, length as u32).build()
         } else {

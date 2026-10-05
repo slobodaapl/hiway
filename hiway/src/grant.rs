@@ -812,8 +812,8 @@ pub(crate) struct Operation {
 
 impl Drop for Operation {
     fn drop(&mut self) {
-        self.node.state.fetch_sub(1, Ordering::Release);
-        if self.notify {
+        let previous = self.node.state.fetch_sub(1, Ordering::Release);
+        if self.notify && previous == (REVOKED | 1) {
             self.node.changed.notify_waiters();
         }
     }

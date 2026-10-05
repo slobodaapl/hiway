@@ -36,19 +36,30 @@ impl hiway::EventSender<Number> for RevokingSender<'_> {
     fn send_now(&self, value: u32) -> Result<(), hiway::TrySendError<u32>> {
         self.sender.send_now(value)
     }
-    async fn send(&self, value: u32) -> Result<(), hiway::SendError<u32>> {
-        let mut send = pin!(self.sender.send(value));
-        poll_fn(|cx| {
-            self.polled.set(true);
-            if self.revoke_inside {
-                assert!(
-                    pin!(self.grant.revoke()).as_mut().poll(cx).is_pending(),
-                    "revocation completed before the entered admission finished"
-                );
-            }
-            send.as_mut().poll(cx)
-        })
-        .await
+    fn send(&self, value: u32) -> impl Future<Output = Result<(), hiway::SendError<u32>>> {
+        if self.revoke_inside {
+            assert!(
+                pin!(self.grant.revoke())
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending(),
+                "revocation completed during unguarded admission construction"
+            );
+        }
+        async move {
+            let mut send = pin!(self.sender.send(value));
+            poll_fn(|cx| {
+                self.polled.set(true);
+                if self.revoke_inside {
+                    assert!(
+                        pin!(self.grant.revoke()).as_mut().poll(cx).is_pending(),
+                        "revocation completed before the entered admission finished"
+                    );
+                }
+                send.as_mut().poll(cx)
+            })
+            .await
+        }
     }
 }
 
@@ -126,16 +137,27 @@ impl<'a> EventReceiver<Number> for RevokingReceiver<'a> {
     fn event_recv_now(&self) -> Result<Option<StreamItem<Self::Value>>, hiway::ReceiveError> {
         self.receiver.event_recv_now()
     }
-    async fn event_recv(&self) -> Result<StreamItem<Self::Value>, hiway::ReceiveError> {
-        let mut receive = pin!(self.receiver.event_recv());
-        poll_fn(|cx| {
-            assert!(
-                pin!(self.grant.revoke()).as_mut().poll(cx).is_pending(),
-                "revocation completed before the entered receive finished"
-            );
-            receive.as_mut().poll(cx)
-        })
-        .await
+    fn event_recv(
+        &self,
+    ) -> impl Future<Output = Result<StreamItem<Self::Value>, hiway::ReceiveError>> {
+        assert!(
+            pin!(self.grant.revoke())
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "revocation completed during unguarded receive construction"
+        );
+        async move {
+            let mut receive = pin!(self.receiver.event_recv());
+            poll_fn(|cx| {
+                assert!(
+                    pin!(self.grant.revoke()).as_mut().poll(cx).is_pending(),
+                    "revocation completed before the entered receive finished"
+                );
+                receive.as_mut().poll(cx)
+            })
+            .await
+        }
     }
 }
 

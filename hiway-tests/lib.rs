@@ -17,8 +17,8 @@ struct EmbeddedGraph;
 /// Compiled for a target with neither a system allocator nor std.
 #[must_use]
 pub fn exercise_static_graph() -> Option<(u16, u8)> {
-    let positions = StaticStream::<embedded_events::Position, 2>::new();
-    let health = StaticStream::<embedded_events::Health, 2>::new();
+    let positions = StaticStream::new();
+    let health = StaticStream::new();
     let graph = EmbeddedGraph::new(&positions, &health);
     let position = graph
         .subscribe::<embedded_events::Position>(SubscriptionRole::Required)

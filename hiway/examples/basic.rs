@@ -31,7 +31,7 @@ where
     P: EventPort<events::Started> + EventReceiver<events::Job>,
 {
     async fn complete_next(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        match self.port.recv::<events::Job>().await? {
+        match self.port.recv().await? {
             StreamItem::Data { value, .. } => {
                 self.completed += 1;
                 println!("completed job {}", value.0);
