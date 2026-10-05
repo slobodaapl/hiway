@@ -54,6 +54,26 @@ impl fmt::Display for EventId {
     }
 }
 
+/// Delivery semantics fixed by the event declaration and provisioned endpoints.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Delivery {
+    /// Sequenced actions or dependent updates. Missing publications are visible.
+    #[default]
+    Ordered,
+    /// Complete, independent snapshots. Unread values may be replaced; new
+    /// subscribers receive the current value. Only observer subscriptions apply.
+    Latest,
+}
+
+impl Delivery {
+    pub(crate) fn follows(self, previous: u64, next: u64) -> bool {
+        match self {
+            Self::Ordered => previous.checked_add(1) == Some(next),
+            Self::Latest => next > previous,
+        }
+    }
+}
+
 /// A routable event declaration.
 pub trait EventSpec {
     /// Payload carried by this event specification.
@@ -67,6 +87,11 @@ pub trait EventSpec {
 
     /// Non-breaking schema revision within [`Self::WIRE_MAJOR`].
     const SCHEMA_REVISION: SchemaRevision = SchemaRevision(1);
+
+    /// Ordered actions by default; opt into `Latest` only for independently
+    /// usable snapshots. Changing this contract requires a new identity or wire
+    /// major, including when the encoded payload layout stays the same.
+    const DELIVERY: Delivery = Delivery::Ordered;
 }
 
 /// A payload tagged with the event specification that selects its route.

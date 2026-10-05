@@ -13,7 +13,9 @@ use core::{
     task::{Context, Poll},
 };
 
+mod accountability;
 mod operation;
+pub use accountability::{Accountability, Connection, Outcome, Record, Records};
 pub use operation::{OpId, Operation, Phase};
 mod protocol;
 pub use protocol::{Direction, Effect, Input, IoResult, Lane, Protocol};
@@ -52,6 +54,8 @@ pub struct Contract {
     pub event: EventId,
     pub major: WireMajor,
     pub revision: SchemaRevision,
+    /// Provisioned delivery semantics; peer bytes cannot select this mode.
+    pub delivery: crate::Delivery,
 }
 impl Contract {
     #[must_use]
@@ -60,6 +64,7 @@ impl Contract {
             event: E::ID,
             major: E::WIRE_MAJOR,
             revision: E::SCHEMA_REVISION,
+            delivery: E::DELIVERY,
         }
     }
 }
@@ -87,6 +92,37 @@ pub trait Reservation {
     /// Returns the adapter's authority rejection, including revocation.
     fn enter(&self) -> Result<Self::Access<'_>, TopicError>;
     fn is_revoked(&self) -> bool;
+    /// Copies owned decoding authority before calling a codec. The returned
+    /// context must not borrow this reservation; callbacks may close its driver.
+    /// The default preserves plain decoding for custom/static reservations.
+    fn decode_context(&self) -> impl crate::DecodeContext + 'static {}
+    /// Dispatches notifications deferred by strict admission. May invoke wakers.
+    fn maintain(&self) {}
+}
+
+impl From<crate::DecodeError> for Error {
+    fn from(error: crate::DecodeError) -> Self {
+        match error {
+            crate::DecodeError::Wire(error) => Self::Wire(error),
+            crate::DecodeError::Resources(error) => Self::Topic(error),
+        }
+    }
+}
+
+mod sealed {
+    pub trait StrictReservation {}
+}
+
+/// Reservations whose revocation checks and deferred admission run no application
+/// callbacks. Implementations are sealed to `()` and `GrantReservation`
+/// (when `std` is enabled). Dropping deferred access does not notify waiters;
+/// the owner must later call [`Reservation::maintain`].
+pub trait StrictReservation: Reservation + sealed::StrictReservation {
+    /// Enters authorized work without dispatching notifications on guard drop.
+    ///
+    /// # Errors
+    /// Returns the adapter's authority rejection, including revocation.
+    fn enter_deferred(&self) -> Result<Self::Access<'_>, TopicError>;
 }
 
 /// Caller-owned static endpoints need no dynamic grant or accounting pool.
@@ -100,6 +136,13 @@ impl Reservation for () {
     }
     fn is_revoked(&self) -> bool {
         false
+    }
+}
+
+impl sealed::StrictReservation for () {}
+impl StrictReservation for () {
+    fn enter_deferred(&self) -> Result<(), TopicError> {
+        Ok(())
     }
 }
 

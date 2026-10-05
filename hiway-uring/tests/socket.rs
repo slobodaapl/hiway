@@ -5,7 +5,7 @@ use hiway::{
     EventId, EventSpec, SchemaRevision, StaticStream, StreamItem, SubscriptionRole, WireCodec,
     WireError,
 };
-use hiway_uring::Driver;
+use hiway_uring::{Driver, Pool, Schedule};
 use stats_alloc::{Region, StatsAlloc, INSTRUMENTED_SYSTEM};
 use std::{
     alloc::System,
@@ -67,8 +67,54 @@ impl Reservation for Charge {
 
 #[test]
 fn sockets_admit_and_cancel_without_transport_allocations() {
-    let mut driver =
-        Driver::<Charge, 2, 64>::new(2).expect("io_uring must be available for this test");
+    invalid_pool_configuration_releases_storage();
+    round_trip_without_transport_allocations(
+        Driver::<Charge, 2, 64>::new(2).expect("io_uring must be available for this test"),
+    );
+    let allocation = Region::new(ALLOCATOR);
+    let pool = Pool::<2, 65_536>::try_new().unwrap();
+    let pool_bytes = allocation.change().bytes_allocated;
+    let construction = Region::new(ALLOCATOR);
+    let driver = Driver::with_pool(2, pool).unwrap();
+    assert!(
+        construction.change().bytes_allocated < pool_bytes,
+        "driver construction allocated another buffer arena"
+    );
+    round_trip_without_transport_allocations(driver);
+    admission_credit_waits_for_destination();
+    saturated_idle_receives_do_not_strand_submission();
+    idle_receive_progresses_with_busy_or_external_wait();
+    dropping_driver_finishes_kernel_ownership();
+    revocation_retains_outstanding_charges();
+    forgetting_a_future_does_not_abandon_kernel_storage();
+    failed_links_reclaim_and_reuse_the_slot();
+    active_links_survive_middle_removal_and_reuse();
+    completion_wake_panic_does_not_lose_delivery_or_cleanup();
+    callback_panic_retains_kernel_storage();
+}
+
+fn invalid_pool_configuration_releases_storage() {
+    for error in [
+        Pool::<0, 64>::try_new().err().unwrap(),
+        Pool::<1, { hiway::transport::HEADER_BYTES - 1 }>::try_new()
+            .err()
+            .unwrap(),
+    ] {
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+    for entries in [0, 1, u32::MAX] {
+        let allocation = Region::new(ALLOCATOR);
+        let pool = Pool::<1, 64>::try_new().unwrap();
+        let error = Driver::<(), 1, 64>::with_pool(entries, pool).err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let change = allocation.change();
+        assert_eq!(change.bytes_allocated, change.bytes_deallocated);
+    }
+}
+
+fn round_trip_without_transport_allocations<const BYTES: usize>(
+    mut driver: Driver<Charge, 2, BYTES>,
+) {
     assert_eq!(driver.wait().unwrap(), 0);
     let source = StaticStream::<Number, 2>::new();
     let destination = StaticStream::<Number, 1>::new();
@@ -120,15 +166,6 @@ fn sockets_admit_and_cancel_without_transport_allocations() {
     let allocations = region.change();
     assert_eq!(allocations.allocations, 0);
     assert_eq!(allocations.reallocations, 0);
-    admission_credit_waits_for_destination();
-    saturated_idle_receives_do_not_strand_submission();
-    dropping_driver_finishes_kernel_ownership();
-    revocation_retains_outstanding_charges();
-    forgetting_a_future_does_not_abandon_kernel_storage();
-    failed_links_reclaim_and_reuse_the_slot();
-    active_links_survive_middle_removal_and_reuse();
-    completion_wake_panic_does_not_lose_delivery_or_cleanup();
-    callback_panic_retains_kernel_storage();
 }
 
 fn completion_wake_panic_does_not_lose_delivery_or_cleanup() {
@@ -352,10 +389,13 @@ fn saturated_idle_receives_do_not_strand_submission() {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
             other => panic!("completion notification: {other:?}"),
         };
-        if signal.0.swap(false, Ordering::SeqCst) || completed {
+        let local = signal.0.swap(false, Ordering::SeqCst);
+        if local {
             for import in &mut imports {
                 assert!(import.as_mut().poll(&mut cx).is_pending());
             }
+        }
+        if local || completed || driver.schedule() == Schedule::Continue {
             driver.advance().unwrap();
         }
         if let Some(StreamItem::Data { value, .. }) = receiver.recv_now().unwrap() {
@@ -364,9 +404,75 @@ fn saturated_idle_receives_do_not_strand_submission() {
         }
         assert!(
             Instant::now() < deadline,
-            "SQ saturation stranded the active link without a wake"
+            "SQ saturation stranded the active link despite scheduling advice and readiness"
         );
         std::thread::yield_now();
+    }
+}
+
+fn idle_receive_progresses_with_busy_or_external_wait() {
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+    for external in [false, true] {
+        let mut driver = Driver::<(), 1, 64>::new(4).unwrap();
+        // SAFETY: a successful eventfd returns a new owned descriptor.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: ownership transfers exactly once to this file.
+        let mut completions = unsafe { std::fs::File::from_raw_fd(fd) };
+        driver.register_eventfd(completions.as_fd()).unwrap();
+        let destination = StaticStream::<Number, 1>::new();
+        let receiver = destination.subscribe(SubscriptionRole::Required).unwrap();
+        let (mut peer, data) = UnixStream::pair().unwrap();
+        let (_credit_peer, control) = UnixStream::pair().unwrap();
+        let mut import = Box::pin(
+            driver
+                .import(destination.sender(), data, control, ())
+                .unwrap(),
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(import.as_mut().poll(&mut cx).is_pending());
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            let mut frame = [0; 46];
+            hiway::transport::encode_frame::<Number>(0, &73, &mut frame).unwrap();
+            peer.write_all(&frame).unwrap();
+            peer
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !driver.advance_io().unwrap().work[0].wake {
+            if external {
+                let mut fd = libc::pollfd {
+                    fd: completions.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll borrows one initialized descriptor for this call.
+                let result = unsafe { libc::poll(&raw mut fd, 1, 2000) };
+                if result < 0 {
+                    assert_eq!(
+                        std::io::Error::last_os_error().kind(),
+                        std::io::ErrorKind::Interrupted
+                    );
+                } else {
+                    assert_eq!(
+                        result, 1,
+                        "external reactor received no completion notification"
+                    );
+                    assert_ne!(fd.revents & libc::POLLIN, 0);
+                    completions.read_exact(&mut [0; 8]).unwrap();
+                }
+            } else {
+                std::hint::spin_loop();
+            }
+            assert!(Instant::now() < deadline);
+        }
+        let _peer = writer.join().unwrap();
+        assert!(receiver.recv_now().unwrap().is_none());
+        driver.dispatch();
+        assert!(import.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            matches!(receiver.recv_now().unwrap(), Some(StreamItem::Data { value, .. }) if *value == 73)
+        );
     }
 }
 
@@ -519,13 +625,24 @@ fn admission_credit_waits_for_destination() {
         .set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
     let mut ack = [0; 9];
-    let error = credit
-        .read(&mut ack)
-        .expect_err("credit preceded local admission");
-    assert!(matches!(
-        error.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    ));
+    let error = loop {
+        match credit.read(&mut ack) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                assert!(
+                    Instant::now() < deadline,
+                    "credit read kept getting interrupted"
+                );
+            }
+            result => break result.expect_err("credit preceded local admission"),
+        }
+    };
+    assert!(
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "{error:?}"
+    );
     signal.0.store(false, Ordering::SeqCst);
     assert!(
         matches!(receiver.recv_now().unwrap(), Some(StreamItem::Data { value, .. }) if *value == 99)

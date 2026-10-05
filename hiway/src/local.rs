@@ -15,7 +15,7 @@ use loom::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::{
     error::{CloseReason, ReceiveError, SendError, TopicError, TrySendError},
-    EventSpec, EventValue,
+    Delivery, EventSpec, EventValue,
 };
 
 /// Whether a receiver may retain data needed by future publications.
@@ -125,6 +125,22 @@ pub trait EventSender<E: EventSpec>: Clone {
     fn send(&self, payload: E::Payload) -> impl Future<Output = Result<(), SendError<E::Payload>>>;
 }
 
+/// Event sender for generic code that must move send operations between tasks.
+///
+/// This opt-in contract provides a `Send` future; [`EventSender`] still supports
+/// local futures.
+pub trait SendEventSender<E: EventSpec>: EventSender<E> {
+    /// Waits for local admission using a future that can move between tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unaccepted payload if local admission is rejected.
+    fn send_future(
+        &self,
+        payload: E::Payload,
+    ) -> impl Future<Output = Result<(), SendError<E::Payload>>> + Send;
+}
+
 /// The publication capability declared by a port.
 pub trait EventPort<E: EventSpec>: Port {
     /// Backend sender retained by this port.
@@ -161,6 +177,21 @@ pub trait EventReceiver<E: EventSpec>: Port {
     ///
     /// Returns the backend's contention, waiter-capacity, or termination error.
     fn event_recv(&self) -> impl Future<Output = Result<StreamItem<Self::Value>, ReceiveError>>;
+}
+
+/// Event receiver for generic code that must move receive operations between tasks.
+///
+/// This opt-in contract provides a `Send` future; [`EventReceiver`] still supports
+/// local futures.
+pub trait SendEventReceiver<E: EventSpec>: EventReceiver<E> {
+    /// Waits for an event using a future that can move between tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's contention, waiter-capacity, or termination error.
+    fn event_recv_future(
+        &self,
+    ) -> impl Future<Output = Result<StreamItem<Self::Value>, ReceiveError>> + Send;
 }
 
 /// Event-value syntax shared by generated and developer-owned ports.
@@ -227,6 +258,23 @@ pub trait PortExt: Port {
         }
     }
 
+    /// Waits for local admission through a sender whose future can move between tasks.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SendEventSender::send_future`] rejection with the original payload.
+    fn publish_send<'a, E>(
+        &'a self,
+        event: EventValue<E>,
+    ) -> impl Future<Output = Result<(), SendError<E::Payload>>> + Send
+    where
+        E: EventSpec,
+        Self: EventPort<E>,
+        <Self as EventPort<E>>::Sender: SendEventSender<E> + 'a,
+    {
+        <Self as EventPort<E>>::event_sender(self).send_future(event.into_inner())
+    }
+
     /// Receives data or a gap for one declared event.
     ///
     /// # Errors
@@ -255,6 +303,21 @@ pub trait PortExt: Port {
         Self: EventReceiver<E>,
     {
         <Self as EventReceiver<E>>::event_recv(self)
+    }
+
+    /// Waits for one declared event through a receiver whose future can move between tasks.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SendEventReceiver::event_recv_future`] errors.
+    fn recv_send<E>(
+        &self,
+    ) -> impl Future<Output = Result<StreamItem<<Self as EventReceiver<E>>::Value>, ReceiveError>> + Send
+    where
+        Self: SendEventReceiver<E>,
+        E: EventSpec,
+    {
+        <Self as SendEventReceiver<E>>::event_recv_future(self)
     }
 }
 
@@ -398,6 +461,7 @@ impl Waiter {
 }
 
 struct State<T: Copy, const CAP: usize, const SUBS: usize> {
+    delivery: Delivery,
     values: [Option<T>; CAP],
     tail: u64,
     cursors: [Option<Cursor>; SUBS],
@@ -407,8 +471,9 @@ struct State<T: Copy, const CAP: usize, const SUBS: usize> {
 }
 
 impl<T: Copy, const CAP: usize, const SUBS: usize> State<T, CAP, SUBS> {
-    const fn new() -> Self {
+    const fn new(delivery: Delivery) -> Self {
         Self {
+            delivery,
             values: [None; CAP],
             tail: 0,
             cursors: [None; SUBS],
@@ -426,6 +491,9 @@ impl<T: Copy, const CAP: usize, const SUBS: usize> State<T, CAP, SUBS> {
                 TopicError::Denied
             });
         }
+        if self.delivery == Delivery::Latest && role == SubscriptionRole::Required {
+            return Err(TopicError::InvalidConfig);
+        }
         let index = self
             .cursors
             .iter()
@@ -435,7 +503,11 @@ impl<T: Copy, const CAP: usize, const SUBS: usize> State<T, CAP, SUBS> {
         self.next_generation = generation.checked_add(1).ok_or(TopicError::Capacity)?;
         self.cursors[index] = Some(Cursor {
             generation,
-            next: self.tail,
+            next: if self.delivery == Delivery::Latest {
+                self.tail.saturating_sub(1)
+            } else {
+                self.tail
+            },
             role,
         });
         Ok(SubscriberKey { index, generation })
@@ -482,6 +554,9 @@ impl<T: Copy, const CAP: usize, const SUBS: usize> State<T, CAP, SUBS> {
             .and_then(Option::as_mut)
             .filter(|cursor| cursor.generation == key.generation)
             .ok_or(ReceiveError::Closed(CloseReason::Closed))?;
+        if self.delivery == Delivery::Latest {
+            cursor.next = cursor.next.max(self.tail.saturating_sub(1));
+        }
         let oldest = self.tail.saturating_sub(CAP as u64);
         if cursor.next < oldest {
             let from = cursor.next;
@@ -536,11 +611,15 @@ where
     /// Creates storage using the host's synchronization policy.
     ///
     /// # Panics
-    /// Panics if `CAP` is zero.
+    /// Panics if `CAP` is zero or a latest-state stream has `CAP != 1`.
     pub fn with_lock(lock: M) -> Self {
         assert!(CAP > 0, "stream capacity must be greater than zero");
+        assert!(
+            !matches!(E::DELIVERY, Delivery::Latest) || CAP == 1,
+            "latest-state streams require capacity one"
+        );
         Self {
-            state: lock.wrap(State::new()),
+            state: lock.wrap(State::new(E::DELIVERY)),
             waiters: core::array::from_fn(|_| Waiter::new()),
             contended: AtomicBool::new(false),
         }
@@ -648,13 +727,15 @@ where
         StaticSender { stream: self }
     }
 
-    /// Starts a subscription at the current tail, without historical replay.
+    /// Starts an ordered subscription at the current tail. Latest-state
+    /// observers replay the current snapshot, then coalesce unread updates.
     ///
     /// # Errors
     ///
     /// Returns [`TopicError::Capacity`] if subscriber slots or generation IDs
     /// are exhausted, [`TopicError::Revoked`] after revocation, or
-    /// [`TopicError::Denied`] after another closure.
+    /// [`TopicError::Denied`] after another closure. Latest-state streams reject
+    /// required subscriptions with [`TopicError::InvalidConfig`].
     pub fn subscribe(
         &self,
         role: SubscriptionRole,
@@ -691,13 +772,17 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if `CAP` is zero.
+    /// Panics if `CAP` is zero or a latest-state stream has `CAP != 1`.
     #[must_use]
     #[cfg(not(loom))]
     pub const fn new() -> Self {
         assert!(CAP > 0, "stream capacity must be greater than zero");
+        assert!(
+            !matches!(E::DELIVERY, Delivery::Latest) || CAP == 1,
+            "latest-state streams require capacity one"
+        );
         Self {
-            state: DefaultMutex::new(State::new()),
+            state: DefaultMutex::new(State::new(E::DELIVERY)),
             waiters: [const { Waiter::new() }; WAITERS],
             contended: AtomicBool::new(false),
         }
@@ -706,13 +791,17 @@ where
     /// Creates an empty stream using instrumented synchronization.
     ///
     /// # Panics
-    /// Panics if `CAP` is zero.
+    /// Panics if `CAP` is zero or a latest-state stream has `CAP != 1`.
     #[must_use]
     #[cfg(loom)]
     pub fn new() -> Self {
         assert!(CAP > 0, "stream capacity must be greater than zero");
+        assert!(
+            !matches!(E::DELIVERY, Delivery::Latest) || CAP == 1,
+            "latest-state streams require capacity one"
+        );
         Self {
-            state: DefaultMutex::new(State::new()),
+            state: DefaultMutex::new(State::new(E::DELIVERY)),
             waiters: core::array::from_fn(|_| Waiter::new()),
             contended: AtomicBool::new(false),
         }
@@ -829,6 +918,22 @@ where
         self.send_now(payload)
     }
     fn send(&self, payload: E::Payload) -> impl Future<Output = Result<(), SendError<E::Payload>>> {
+        self.send(payload)
+    }
+}
+
+impl<E, const CAP: usize, const SUBS: usize, const WAITERS: usize, M> SendEventSender<E>
+    for StaticSender<'_, E, CAP, SUBS, WAITERS, M>
+where
+    E: EventSpec,
+    E::Payload: Copy + Send,
+    M: LockFamily,
+    StaticStream<E, CAP, SUBS, WAITERS, M>: Sync,
+{
+    fn send_future(
+        &self,
+        payload: E::Payload,
+    ) -> impl Future<Output = Result<(), SendError<E::Payload>>> + Send {
         self.send(payload)
     }
 }
@@ -970,6 +1075,21 @@ where
         self.recv_now()
     }
     fn event_recv(&self) -> impl Future<Output = Result<StreamItem<Self::Value>, ReceiveError>> {
+        self.recv()
+    }
+}
+
+impl<E, const CAP: usize, const SUBS: usize, const WAITERS: usize, M> SendEventReceiver<E>
+    for StaticReceiver<'_, E, CAP, SUBS, WAITERS, M>
+where
+    E: EventSpec,
+    E::Payload: Copy,
+    M: LockFamily,
+    StaticStream<E, CAP, SUBS, WAITERS, M>: Sync,
+{
+    fn event_recv_future(
+        &self,
+    ) -> impl Future<Output = Result<StreamItem<Self::Value>, ReceiveError>> + Send {
         self.recv()
     }
 }

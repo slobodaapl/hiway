@@ -25,13 +25,13 @@ pub struct Limits {
     pub grants: usize,
     /// Live subscriptions.
     pub subscriptions: usize,
-    /// Total item allowance: event reservations plus generic transport storage.
+    /// Total item allowance: event reservations plus generic transport/resources.
     pub retained_items: usize,
     /// Total waiter allowance: event reservations plus transport/control waits.
     pub waiters: usize,
     /// Attached transport sessions.
     pub connections: usize,
-    /// Transport-owned encoded bytes.
+    /// Owned bytes: transport storage plus declared decoded/retained resources.
     pub bytes: usize,
 }
 
@@ -319,7 +319,7 @@ impl Grant {
     }
 
     pub(crate) fn maintain_operations(&self) {
-        self.node.changed.notify_waiters();
+        self.node.maintain_operations();
     }
 
     pub(crate) fn maintain_tree(&self) {
@@ -613,6 +613,14 @@ impl GrantNode {
             return Err(TopicError::Revoked);
         }
         Ok(operation)
+    }
+
+    fn maintain_operations(&self) {
+        // Revocation sets this bit before registering its operation waiter.
+        // Releases before the cutoff are reflected in its count check.
+        if self.state.load(Ordering::Acquire) & REVOKED != 0 {
+            self.changed.notify_waiters();
+        }
     }
 
     pub(crate) fn try_charge(self: &Arc<Self>, usage: Limits) -> Result<Lease, TopicError> {

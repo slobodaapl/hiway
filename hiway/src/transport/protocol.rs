@@ -1,4 +1,6 @@
-use super::{Contract, Error, OpId, CREDIT_BYTES, HEADER_BYTES};
+use super::{
+    Accountability, Connection, Contract, Error, OpId, Record, CREDIT_BYTES, HEADER_BYTES,
+};
 use crate::SchemaRevision;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +80,6 @@ enum Stage {
     Header,
     Payload,
     Admission,
-    Acknowledge,
 }
 
 /// Deterministic HWY1 protocol. Storage and execution remain outside the model.
@@ -97,6 +98,7 @@ pub struct Protocol {
     revision: SchemaRevision,
     credited: bool,
     closed: Option<Error>,
+    accountability: Option<Accountability>,
 }
 
 impl Protocol {
@@ -124,6 +126,7 @@ impl Protocol {
             revision: contract.revision,
             credited: false,
             closed: None,
+            accountability: None,
         })
     }
 
@@ -134,6 +137,38 @@ impl Protocol {
     #[must_use]
     pub fn closed(&self) -> Option<Error> {
         self.closed
+    }
+
+    /// Creates a tracked protocol with host-supplied attribution and at most
+    /// eight retained records. The wire format remains unchanged.
+    ///
+    /// # Errors
+    /// Returns the same capacity errors as [`Self::new`].
+    pub fn with_connection(
+        contract: Contract,
+        direction: Direction,
+        capacity: usize,
+        connection: Connection,
+    ) -> Result<Self, Error> {
+        let mut protocol = Self::new(contract, direction, capacity)?;
+        protocol.accountability = Some(Accountability::new(connection, contract, direction));
+        Ok(protocol)
+    }
+
+    pub fn pop_record(&mut self) -> Option<Record> {
+        self.accountability.as_mut().and_then(Accountability::pop)
+    }
+
+    #[must_use]
+    pub fn lost_records(&self) -> u64 {
+        self.accountability.as_ref().map_or(0, Accountability::lost)
+    }
+
+    /// Associates a source item before invoking its codec, including encode failure.
+    pub fn observe_sequence(&mut self, sequence: u64) {
+        if let Some(accountability) = &mut self.accountability {
+            accountability.observe(sequence);
+        }
     }
 
     #[must_use]
@@ -163,17 +198,19 @@ impl Protocol {
                     offset,
                     length: self.length - offset,
                 }),
-                Stage::Admission => Some(Effect::Admit {
+                Stage::Admission if !self.credited => Some(Effect::Admit {
                     length: self.length - HEADER_BYTES,
                     revision: self.revision,
                 }),
                 _ => None,
             },
-            Lane::CreditSend if self.stage == Stage::Acknowledge => Some(Effect::Transmit {
-                lane,
-                offset,
-                length: CREDIT_BYTES - offset,
-            }),
+            Lane::CreditSend if self.direction == Direction::Import && self.credited => {
+                Some(Effect::Transmit {
+                    lane,
+                    offset,
+                    length: CREDIT_BYTES - offset,
+                })
+            }
             Lane::CreditSend => None,
             Lane::CreditReceive => Some(Effect::Receive {
                 lane,
@@ -190,7 +227,7 @@ impl Protocol {
     #[must_use]
     pub fn credit(&self) -> [u8; CREDIT_BYTES] {
         let mut credit = [1; CREDIT_BYTES];
-        credit[1..].copy_from_slice(&self.sequence.to_le_bytes());
+        credit[1..].copy_from_slice(&self.previous.unwrap_or(self.sequence).to_le_bytes());
         credit
     }
 
@@ -203,6 +240,16 @@ impl Protocol {
         let result = self.transition(input);
         if let Err(error) = result {
             self.closed.get_or_insert(error);
+        }
+        if let (Some(error), Some(accountability)) = (self.closed, &mut self.accountability) {
+            if matches!(
+                input,
+                Input::Revoked | Input::Closed(Error::Closed | Error::Revoked)
+            ) {
+                accountability.cancel();
+            } else {
+                accountability.finish(error);
+            }
         }
         result
     }
@@ -266,21 +313,31 @@ impl Protocol {
                     return Err(Error::Protocol);
                 }
                 self.sequence = sequence;
+                self.observe_sequence(sequence);
                 self.length = length;
                 self.offsets[0] = 0;
                 self.credited = false;
                 self.stage = Stage::Sending;
+                if let Some(accountability) = &mut self.accountability {
+                    accountability.admitted();
+                }
             }
             Input::Admitted => {
                 if let Some(error) = self.closed {
                     return Err(error);
                 }
-                if self.stage != Stage::Admission {
+                if self.stage != Stage::Admission || self.credited {
                     return Err(Error::Protocol);
                 }
                 self.previous = Some(self.sequence);
+                if let Some(accountability) = &mut self.accountability {
+                    accountability.admitted();
+                }
+                self.credited = true;
                 self.offsets[Lane::CreditSend as usize] = 0;
-                self.stage = Stage::Acknowledge;
+                self.offsets[Lane::Data as usize] = 0;
+                self.length = HEADER_BYTES;
+                self.stage = Stage::Header;
             }
         }
         Ok(())
@@ -295,10 +352,16 @@ impl Protocol {
                         Stage::Source
                     } else {
                         Stage::Credit
+                    };
+                    if self.credited {
+                        if let Some(accountability) = &mut self.accountability {
+                            accountability.completed(self.sequence);
+                        }
                     }
                 }
                 Stage::Header if offset >= HEADER_BYTES => {
                     let header = buffer.get(..HEADER_BYTES).ok_or(Error::Protocol)?;
+                    self.observe_sequence(u64::from_le_bytes(header[26..34].try_into().unwrap()));
                     if header[..4] != *b"HWY1"
                         || header[4..20] != self.contract.event.as_u128().to_le_bytes()
                         || header[20..22] != self.contract.major.0.to_le_bytes()
@@ -319,7 +382,7 @@ impl Protocol {
                     }
                     if self
                         .previous
-                        .is_some_and(|last| last.checked_add(1) != Some(self.sequence))
+                        .is_some_and(|last| !self.contract.delivery.follows(last, self.sequence))
                     {
                         return Err(Error::Protocol);
                     }
@@ -334,9 +397,10 @@ impl Protocol {
                 _ => return Err(Error::Protocol),
             },
             Lane::CreditSend if offset == CREDIT_BYTES => {
-                self.stage = Stage::Header;
-                self.offsets[0] = 0;
-                self.length = HEADER_BYTES;
+                self.credited = false;
+                if let Some(accountability) = &mut self.accountability {
+                    accountability.completed(self.previous.expect("credit follows admission"));
+                }
             }
             Lane::CreditReceive => {
                 if self.direction == Direction::Import {
@@ -355,6 +419,9 @@ impl Protocol {
                     self.offsets[lane as usize] = 0;
                     if self.stage == Stage::Credit {
                         self.stage = Stage::Source;
+                        if let Some(accountability) = &mut self.accountability {
+                            accountability.completed(self.sequence);
+                        }
                     }
                 }
             }

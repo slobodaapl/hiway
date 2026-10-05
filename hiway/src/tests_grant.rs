@@ -647,3 +647,79 @@ fn revocation_listeners_ignore_accounting_and_wake_for_the_subtree_cutoff() {
     assert!(root_revoked.as_mut().poll(&mut context).is_ready());
     assert!(child_revoked.as_mut().poll(&mut context).is_ready());
 }
+
+#[test]
+fn revocation_waits_for_all_admissions_and_wakes_after_release() {
+    for deferred in [false, true] {
+        let root = GrantNode::root(Limits::ZERO);
+        let first = root.enter_mode(EVENT, Rights::PUBLISH, !deferred).unwrap();
+        let last = root.enter_mode(EVENT, Rights::PUBLISH, !deferred).unwrap();
+        let counter = Arc::new(WakeCount::default());
+        let waker = counter.clone().into();
+        let mut context = Context::from_waker(&waker);
+        let mut revoke = core::pin::pin!(root.revoke());
+        assert!(revoke.as_mut().poll(&mut context).is_pending());
+        assert!(matches!(
+            root.enter(EVENT, Rights::PUBLISH),
+            Err(TopicError::Revoked)
+        ));
+
+        let notifications = counter.0.load(Ordering::Relaxed);
+        drop(first);
+        assert_eq!(counter.0.load(Ordering::Relaxed), notifications);
+        if deferred {
+            root.maintain_operations();
+        }
+        assert!(revoke.as_mut().poll(&mut context).is_pending());
+
+        let notifications = counter.0.load(Ordering::Relaxed);
+        drop(last);
+        if deferred {
+            assert_eq!(counter.0.load(Ordering::Relaxed), notifications);
+            root.maintain_operations();
+        }
+        assert!(counter.0.load(Ordering::Relaxed) > notifications);
+        assert_eq!(
+            revoke.as_mut().poll(&mut context),
+            core::task::Poll::Ready(Ok(()))
+        );
+    }
+}
+
+#[test]
+fn last_release_racing_revocation_cannot_leave_revoker_asleep() {
+    for deferred in [false, true] {
+        for _ in 0..64 {
+            let root = GrantNode::root(Limits::ZERO);
+            let operation = root.enter_mode(EVENT, Rights::PUBLISH, !deferred).unwrap();
+            let counter = Arc::new(WakeCount::default());
+            let waker = counter.clone().into();
+            let mut context = Context::from_waker(&waker);
+            let mut revoke = core::pin::pin!(root.revoke());
+            let barrier = Barrier::new(2);
+            thread::scope(|scope| {
+                let released = scope.spawn(|| {
+                    barrier.wait();
+                    drop(operation);
+                });
+                barrier.wait();
+                let result = revoke.as_mut().poll(&mut context);
+                assert!(matches!(
+                    result,
+                    core::task::Poll::Pending | core::task::Poll::Ready(Ok(()))
+                ));
+                released.join().unwrap();
+                if deferred {
+                    root.maintain_operations();
+                }
+                if result.is_pending() {
+                    assert!(counter.0.load(Ordering::Relaxed) > 0);
+                    assert_eq!(
+                        revoke.as_mut().poll(&mut context),
+                        core::task::Poll::Ready(Ok(()))
+                    );
+                }
+            });
+        }
+    }
+}

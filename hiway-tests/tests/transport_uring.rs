@@ -231,7 +231,7 @@ fn grant() -> Grant {
                 retained_items: 4,
                 waiters: 4,
                 connections: 2,
-                bytes: 1024,
+                bytes: Driver::<hiway::transport::GrantReservation, 1, 64>::reservation_bytes(),
                 ..Limits::ZERO
             },
         )

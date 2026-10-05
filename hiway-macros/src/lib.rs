@@ -120,14 +120,23 @@ fn conditional_attribute(meta: &syn::Meta) -> Result<Option<TokenStream2>> {
     }
 }
 
-fn explicit_event_id(attributes: &[syn::Attribute]) -> Result<Option<syn::LitStr>> {
+fn event_options(attributes: &[syn::Attribute]) -> Result<(Option<syn::LitStr>, bool)> {
     let mut id = None;
+    let mut latest = false;
     for attribute in attributes
         .iter()
         .filter(|attribute| attribute.path().is_ident("event"))
     {
-        let mut found_id = false;
+        let mut found_option = false;
         attribute.parse_nested_meta(|meta| {
+            if meta.path.is_ident("latest") {
+                if latest {
+                    return Err(meta.error("duplicate latest-state declaration"));
+                }
+                latest = true;
+                found_option = true;
+                return Ok(());
+            }
             if !meta.path.is_ident("id") {
                 return Err(meta.error("unknown event attribute field"));
             }
@@ -141,18 +150,18 @@ fn explicit_event_id(attributes: &[syn::Attribute]) -> Result<Option<syn::LitStr
                     "event id must not be empty",
                 ));
             }
-            found_id = true;
+            found_option = true;
             id = Some(value);
             Ok(())
         })?;
-        if !found_id {
+        if !found_option {
             return Err(syn::Error::new_spanned(
                 attribute,
                 "event attribute requires `id = \"...\"`",
             ));
         }
     }
-    Ok(id)
+    Ok((id, latest))
 }
 
 // Keep variant validation and its generated items together.
@@ -181,7 +190,9 @@ fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2
     let mut implementations = Vec::with_capacity(item.variants.len());
     let mut enum_conversions = Vec::with_capacity(item.variants.len());
     for variant in &mut item.variants {
-        let explicit_id = explicit_event_id(&variant.attrs)?;
+        let (explicit_id, latest) = event_options(&variant.attrs)?;
+        let delivery =
+            latest.then(|| quote!(const DELIVERY: #hiway::Delivery = #hiway::Delivery::Latest;));
         variant
             .attrs
             .retain(|attribute| !attribute.path().is_ident("event"));
@@ -247,6 +258,7 @@ fn expand_events(arguments: &EventsArgs, item: &ItemEnum) -> Result<TokenStream2
                 type Payload = #payload;
                 const ID: #hiway::EventId = #event_id;
                 #wire_constants
+                #delivery
             }
         });
         enum_conversions.push(quote! {
@@ -754,6 +766,27 @@ fn port_event_impls(
     sender_types: &[TokenStream2],
     receiver_types: &[TokenStream2],
 ) -> TokenStream2 {
+    let mut used_tokens = quote!(#generics #port #hiway #(#sender_types)* #(#receiver_types)*);
+    for (event, name, field) in send.iter().chain(recv) {
+        used_tokens.extend(quote!(#event #name #field));
+    }
+    let mut tokens: Vec<_> = used_tokens.into_iter().collect();
+    let mut names = std::collections::HashSet::new();
+    while let Some(token) = tokens.pop() {
+        match token {
+            proc_macro2::TokenTree::Group(group) => tokens.extend(group.stream()),
+            proc_macro2::TokenTree::Ident(ident) => {
+                names.insert(ident.to_string().trim_start_matches("r#").to_owned());
+            }
+            _ => {}
+        }
+    }
+    let fresh_ident = |mut name: String| {
+        while names.contains(&name) {
+            name.push('_');
+        }
+        format_ident!("{name}")
+    };
     let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
     let port_impl =
         quote!(impl #impl_generics #hiway::Port for #port #type_generics #where_clause {});
@@ -806,11 +839,98 @@ fn port_event_impls(
             }
         }
     });
+    let send_receiver_impls =
+        recv.iter()
+            .zip(receiver_types)
+            .map(|((event, _, field), receiver)| {
+                send_receiver_impl(
+                    hiway,
+                    generics,
+                    port,
+                    event,
+                    field,
+                    receiver,
+                    &fresh_ident("__SendReceiver".to_owned()),
+                )
+            });
 
     quote! {
         #port_impl
         #(#publication_impls)*
         #(#receiver_impls)*
+        #(#send_receiver_impls)*
+    }
+}
+
+fn send_receiver_impl(
+    hiway: &TokenStream2,
+    generics: &syn::Generics,
+    port: &Ident,
+    event: &Path,
+    field: &Ident,
+    receiver: &TokenStream2,
+    parameter: &Ident,
+) -> TokenStream2 {
+    let receiver_field = format_ident!("__recv_{field}");
+    let receiver_parameter = syn::parse2::<proc_macro2::Ident>(receiver.clone())
+        .ok()
+        .filter(|ident| {
+            generics
+                .type_params()
+                .any(|parameter| parameter.ident == *ident)
+        });
+    let mut send_generics = generics.clone();
+    let send_receiver = if let Some(receiver_parameter) = receiver_parameter {
+        send_generics
+            .make_where_clause()
+            .predicates
+            .push(syn::parse_quote!(
+                #receiver_parameter: #hiway::SendEventReceiver<#event>
+            ));
+        quote!(#receiver_parameter)
+    } else {
+        send_generics.params.push(syn::parse_quote!(#parameter));
+        let receiver_path = match syn::parse2::<syn::TypePath>(receiver.clone()) {
+            Ok(receiver_path) => receiver_path,
+            Err(error) => return error.to_compile_error(),
+        };
+        let factory = match receiver_path.qself {
+            Some(qself) => qself.ty,
+            None => {
+                return syn::Error::new_spanned(receiver, "expected owned receiver projection")
+                    .to_compile_error()
+            }
+        };
+        let predicates = &mut send_generics.make_where_clause().predicates;
+        predicates.push(syn::parse_quote!(
+            #factory: #hiway::OwnedPortBinding<#event, Receiver = #parameter>
+        ));
+        predicates.push(syn::parse_quote!(
+            #parameter: #hiway::SendEventReceiver<#event> + 'static
+        ));
+        quote!(#parameter)
+    };
+    let (_, type_generics, _) = generics.split_for_impl();
+    let (send_impl_generics, _, send_where_clause) = send_generics.split_for_impl();
+    quote! {
+        impl #send_impl_generics #hiway::SendEventReceiver<#event>
+            for #port #type_generics #send_where_clause
+        {
+            fn event_recv_future(
+                &self,
+            ) -> impl ::core::future::Future<
+                Output = ::core::result::Result<
+                    #hiway::StreamItem<
+                        <Self as #hiway::EventReceiver<#event>>::Value,
+                    >,
+                    #hiway::ReceiveError,
+                >,
+            > + ::core::marker::Send {
+                <#send_receiver as #hiway::SendEventReceiver<#event>>::event_recv_future(
+                    &self.#receiver_field,
+                )
+            }
+        }
     }
 }
 

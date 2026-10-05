@@ -458,7 +458,7 @@ fn async_errors_preserve_move_only_borrowed_payloads_without_debug_bounds() {
 
 #[test]
 fn stale_membership_keys_cannot_read_reused_subscriber_slots() {
-    let mut state = State::<u32, 1, 1>::new();
+    let mut state = State::<u32, 1, 1>::new(Delivery::Ordered);
     let old = state.subscribe(SubscriptionRole::Observer).unwrap();
     state.cursors[old.index] = None;
     let current = state.subscribe(SubscriptionRole::Observer).unwrap();

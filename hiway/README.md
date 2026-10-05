@@ -48,6 +48,70 @@ struct WorkerPort;
 `examples/many_components.rs` shows one port type shared by many instances.
 `examples/terminal.rs` shows an observer-only component.
 
+Local endpoints may use non-`Send` payloads and futures. Owned generated
+ports backed by thread-safe streams also work with `tokio::spawn` through the
+ordinary publication and receive methods. Generic spawning helpers can use
+`SendEventSender` and `SendEventReceiver` bounds with `PortExt::publish_send`
+and `recv_send` to require movable futures. These optional contracts do not
+change local implementations or ordinary event-type inference.
+
+## Latest-state snapshots
+
+Events are ordered by default. Mark a complete, independently usable snapshot
+with `#[event(latest)]`, or set `EventSpec::DELIVERY` to `Delivery::Latest` in a
+manual declaration. Actions and dependent updates keep ordered delivery.
+
+Latest-state streams have capacity one and accept only observers. A new
+subscription receives the current snapshot; unread updates coalesce to the
+newest version. Reading or maintaining the stream does not discard that state.
+
+Dynamic publishers need an event-item allowance of at least two: the current
+snapshot and its prepared replacement. That allowance tracks stream entries,
+not consumer-held `Arc` clones. Use resource reservations and `Resource<T>`
+for storage that must stay charged until its last owner drops. Strict prepared
+replacement defers one retired snapshot to `DynamicFabric::maintain`; another
+strict replacement returns `MaintenanceRequired` until that slot is reclaimed.
+
+Unix and `io_uring` links accept forward sequence jumps for latest-state events,
+but reject repeated or backward versions. Ordered links retain contiguous
+sequence checks and terminate on observer gaps. Delivery mode is part of the
+provisioned event contract; changing it requires a new event ID or wire major.
+
+## Connection accountability
+
+Transport records identify the provisioned connection, its generation, event
+contract, direction and most recently observed frame sequence. Peer-supplied
+event names or payload identity cannot change that attribution.
+
+`hiway-uring::Driver` records every attached link. Its `import_tracked` and
+`export_tracked` methods also return the assigned connection identity, so the
+host can associate records with an endpoint. IDs are slots within that driver;
+successful slot reuse increments the generation without wrapping. Drain with
+`pop_record`. Each connection retains eight records, and retired connections share
+a 64-record archive. Ordering is per connection.
+
+`UnixLink::import_tracked` and `export_tracked` take a host-assigned
+`transport::Connection` and return a `UnixAccountability` handle. The host must
+keep ID/generation pairs unique within its accountability domain. The handle
+retains eight records and survives link completion or cancellation. Existing Unix
+constructors remain untracked. Standalone protocol users can select
+`Protocol::with_connection` and drain its records directly.
+
+Admission means local destination acceptance on import, or acceptance of an
+encoded frame for I/O on export. Completion means credit sent on import, or
+full frame transmission plus matching credit received on export. It does not
+acknowledge application processing. Terminal framing, codec, endpoint and I/O
+failures produce rejection records; local closure, revocation and dropped link
+futures produce cancellation records. Cancellation does not replace terminal
+kernel completions or release their buffers early.
+Terminal records retain the last observed sequence even if that frame completed.
+
+Overflow discards the oldest records. `lost_records` reports a saturating count
+of overwritten records, including retired `io_uring` generations. The host drains
+and persists records outside the strict I/O path; recording performs no file
+I/O or application callbacks. Construction failures remain returned errors,
+before a link has been attached.
+
 ## Components across backends
 
 `examples/backends.rs` runs the same `Worker<P>` with borrowed static
@@ -179,12 +243,70 @@ and local endpoint readiness can register an eventfd for completion notification
 and include local wakers in their own wait mechanism. Revocation is checked on
 poll and driver progress, and authorization is checked before each submission.
 
+Hosts needing callback isolation use `advance_io()` followed by `dispatch()`
+outside the strict path. `advance_io()` handles I/O and returns a fixed-size
+`Progress` report: I/O counts, scheduling advice, and per-slot wake, reclamation
+and authority notification flags. It runs no application codec, endpoint future, destructor
+or waker callback. Authorization still brackets submission. This path accepts
+`()` or `GrantReservation`; custom reservations use `advance()`.
+
+Pending work stays in the driver until dispatched, including after submission
+errors; `pending_work()` exposes it without consuming it. Ignoring a report
+does not lose work. Call `dispatch()` before parking, and poll link futures
+separately for decoding and endpoint operations. Dispatch may execute callbacks
+and destructors. Neither syscall latency nor callback execution time has a hard
+deadline; premature driver drop still drains outstanding I/O.
+
+`advance_io_with_budget(Budget { completions, submissions, bytes })` sets limits
+for one strict pass; `advance_with_budget` also dispatches callbacks. All three
+limits must be nonzero. Counts include control traffic and cancellation SQEs;
+cancellation consumes no byte allowance. The byte limit caps newly requested
+send/receive lengths, splitting frames and credit messages when needed. It does
+not cap bytes completing from earlier passes. The convenience methods use the
+ring capacities for CQEs/SQEs and no additional byte limit. Each pass still
+checks authority for every configured slot; these are I/O limits, not deadlines.
+
+Links take turns submitting one request per round, with rotating lanes and at
+most three rounds per pass. A link denied byte or SQ capacity retains its next
+turn. Cancellation shares the submission limit and can use the reserved SQ
+entry. Link wakes report local frame readiness or closure, not submission
+backlog or admission contention.
+
+`Progress::schedule` distinguishes `Continue` (advance again with a replenished
+budget), `Retry` (admission contention requiring a host-scheduled retry), and
+`Wait` (await external readiness). Contention is attempted once per link per
+pass and generates no retry wake. After dispatching work and polling ready
+futures, refresh this advice with `driver.schedule()`: callbacks may have added
+work. Host readiness includes ring, endpoint and authority changes. `wait()`
+returns immediately when local I/O, retry or dispatch work remains; otherwise
+it waits only for ring completion, so combined readiness belongs to the host.
+
+Link callbacks run outside the shared slot-table borrow, allowing them to poll
+or drop other link futures synchronously. Codec results are checked against
+closure and revocation before being committed. Waker replacement rechecks
+readiness after clone/drop callbacks, so progress during registration is not lost.
+
 The arena never grows after construction. Buffers, operation records and waiter
 slots are reused; transport operations and link removal allocate nothing.
+`hiway_uring::Pool::try_new()` allocates the buffers separately;
+`Driver::with_pool(entries, pool)` takes ownership without reallocating them.
+`Driver::new(entries)` creates its own pool and delegates to `with_pool`.
 Application codecs, endpoint implementations, reservation callbacks, supplied
 wakers and the kernel retain their own allocation behavior. Submitted buffers
 and reservation guards remain owned until terminal completion. Link drop marks
-its record closing; driver drop cancels and drains outstanding I/O. If teardown
+its record closing. For shutdown, `stop_admission()` rejects new link attachments
+while existing links continue; `cancel_all()` stops admission and closes all
+links without callbacks or waiting. Advance cancellation with
+`advance_io_with_budget`, then dispatch at most a chosen number of slot records
+with `dispatch_with_budget(slots)`. Dispatch rotates between slots; its limit
+bounds records, not callback execution time. A zero limit does no work.
+
+Keep the driver owned across host turns until `shutdown_complete()` reports
+terminal completions and dispatched reclamation. This works even while link
+futures remain alive; they observe closure when polled and retain the buffer
+pool until dropped. Dispatch wakes and destructors outside the critical path.
+Driver drop after completion runs no draining loop. Dropping an unfinished
+driver remains a blocking cancellation-and-drain fallback. If teardown
 cannot establish completion, it retains the domain's storage rather than free
 buffers still accessible to the kernel.
 
@@ -193,6 +315,22 @@ pending effects require explicit acceptance and completion, and receive
 completion grants no admission credit. It uses the existing HWY1 data and
 credit format. Grant-backed hosts use `Grant::reserve_transport` with the
 driver's `reservation_bytes()`; static endpoints can use `()`.
+
+Decoded storage and retained application resources use
+`Grant::reserve_resources(items, bytes)`. Reserve a declared upper bound before
+allocation, then `reservation.attach(value)` transfers the charge into
+`Resource<T>`. Moving that owner or retaining it through `Arc` keeps the charge;
+the value is destroyed before quota returns. Hold it through the last external
+use, including GPU completion. A separately cloned allocation needs its own
+reservation. Resource costs use the generic allowance, without borrowing an
+event's reserved data capacity.
+
+Grant-backed imports in both transport backends call
+`WireCodec::decode_with_resources` with the host's grant. Override that method
+to reserve before decoding and carry the reservation in the payload or its
+resources. The default preserves legacy decoding without resource accounting.
+Native codecs and their declared costs remain trusted. Admission credit and
+transport shutdown do not retire a retained resource; its last owner does.
 
 ```sh
 cargo run -p hiway-uring --example round_trip

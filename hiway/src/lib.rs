@@ -66,6 +66,8 @@ mod link;
 mod local;
 pub mod locking;
 mod metadata;
+#[cfg(feature = "std")]
+mod resources;
 mod schema;
 #[cfg(feature = "std")]
 mod synchronization;
@@ -75,7 +77,7 @@ pub mod transport;
 mod unix;
 mod wire;
 
-pub use event::{EventId, EventSpec, EventValue};
+pub use event::{Delivery, EventId, EventSpec, EventValue};
 pub use hiway_macros::{events, graph, port};
 pub use link::Link;
 pub use metadata::{DedupKey, EventMetadata, OriginId, SchemaRevision, WireEnvelope, WireMajor};
@@ -83,7 +85,12 @@ pub use schema::{
     validate_evolution, validate_schema, FieldKind, FieldPresence, FieldSpec, Schema, SchemaError,
 };
 pub use transform::{AsyncTransform, Then, Transform, TransformOp};
-pub use wire::{EnvelopeHeader, WireCodec, WireError, ENVELOPE_HEADER_BYTES};
+pub use wire::{
+    DecodeContext, DecodeError, EnvelopeHeader, WireCodec, WireError, ENVELOPE_HEADER_BYTES,
+};
+
+#[cfg(feature = "std")]
+pub use resources::{Resource, ResourceReservation};
 
 #[cfg(feature = "std")]
 pub use alloc_local::{
@@ -94,13 +101,13 @@ pub use alloc_local::{
 pub use grant::{Grant, Limits, Permission, Rights, StreamLimits};
 
 #[cfg(all(feature = "tokio-io", unix))]
-pub use unix::{IpcError, UnixLink};
+pub use unix::{IpcError, UnixAccountability, UnixLink};
 
 pub use local::{
     publish, EventPort, EventReceiver, EventSender, OwnedPortBinding, PayloadValue, Port,
-    PortBinding, PortExt, PortPreparation, PreparedSend, StaticFabric, StaticPublication,
-    StaticReceiveFuture, StaticReceiver, StaticSendFuture, StaticSender, StaticStream, StreamItem,
-    SubscriptionRole, Topic,
+    PortBinding, PortExt, PortPreparation, PreparedSend, SendEventReceiver, SendEventSender,
+    StaticFabric, StaticPublication, StaticReceiveFuture, StaticReceiver, StaticSendFuture,
+    StaticSender, StaticStream, StreamItem, SubscriptionRole, Topic,
 };
 
 pub use error::{

@@ -1,4 +1,5 @@
 use core::{
+    future::Future,
     marker::PhantomData,
     ops::{Deref, DerefMut},
 };
@@ -14,9 +15,9 @@ use tokio::sync::Notify;
 use crate::{
     grant::{Grant, GrantNode, Lease, Limits, Permission, Rights, StreamLimits},
     synchronization::{AtomicBool, AtomicUsize, Mutex, MutexGuard, Ordering, TryLockError},
-    CloseReason, EventId, EventPort, EventReceiver, EventSender, EventSpec, OwnedPortBinding, Port,
-    PortBinding, ReceiveError, SendError, StreamItem, SubscriptionRole, TopicError,
-    TopicTypeMismatch, TrySendError,
+    CloseReason, Delivery, EventId, EventPort, EventReceiver, EventSender, EventSpec,
+    OwnedPortBinding, Port, PortBinding, ReceiveError, SendError, SendEventReceiver,
+    SendEventSender, StreamItem, SubscriptionRole, TopicError, TopicTypeMismatch, TrySendError,
 };
 
 /// Physical bounds for one retained stream.
@@ -90,6 +91,7 @@ impl DynamicFabric {
     }
 
     /// Declares a typed stream. An identical declaration is idempotent.
+    /// Latest-state streams require capacity one.
     ///
     /// # Errors
     ///
@@ -114,7 +116,7 @@ impl DynamicFabric {
             ..Limits::ZERO
         };
         allowance.validate()?;
-        if config.capacity == 0 {
+        if config.capacity == 0 || (E::DELIVERY == Delivery::Latest && config.capacity != 1) {
             return Err(TopicError::InvalidConfig);
         }
         let check_existing = |existing: Arc<dyn Maintenance>| {
@@ -124,6 +126,7 @@ impl DynamicFabric {
                 .ok_or(TopicError::TypeMismatch(TopicTypeMismatch { id: E::ID }))?;
             if stream.config == config
                 && stream.wire_major == E::WIRE_MAJOR
+                && stream.delivery == E::DELIVERY
                 && !stream.lock().closed
             {
                 Ok(())
@@ -148,6 +151,7 @@ impl DynamicFabric {
         let stream = Arc::new(Stream {
             config,
             wire_major: E::WIRE_MAJOR,
+            delivery: E::DELIVERY,
             state: Mutex::new(State {
                 entries,
                 subscribers,
@@ -155,6 +159,7 @@ impl DynamicFabric {
                 next_cursor: 0,
                 closed: false,
                 needs_room: false,
+                retired: None,
             }),
             changed: Arc::new(Notify::new()),
             contended: AtomicBool::new(false),
@@ -196,6 +201,7 @@ impl DynamicFabric {
             (
                 core::mem::take(&mut state.entries),
                 core::mem::take(&mut state.subscribers),
+                state.retired.take(),
             )
         };
         drop(retired);
@@ -274,7 +280,7 @@ impl Grant {
         let stream = stream
             .downcast::<Stream<E::Payload>>()
             .map_err(|_| TopicError::TypeMismatch(TopicTypeMismatch { id: E::ID }))?;
-        if stream.wire_major != E::WIRE_MAJOR {
+        if stream.wire_major != E::WIRE_MAJOR || stream.delivery != E::DELIVERY {
             return Err(TopicError::InvalidConfig);
         }
         self.register_stream(E::ID, &stream.changed)?;
@@ -287,7 +293,8 @@ impl Grant {
     ///
     /// Returns [`TopicError`] for missing publication rights, revocation, an
     /// unknown or incompatible declaration, exhausted notification slots, or a
-    /// zero event-item allowance.
+    /// insufficient event-item allowance. Latest-state publishers need at least
+    /// two items for the current snapshot and its prepared replacement.
     ///
     /// # Panics
     ///
@@ -298,7 +305,12 @@ impl Grant {
         E::Payload: Send + Sync + 'static,
     {
         let stream = self.stream::<E>(Rights::PUBLISH)?;
-        if self.stream_limits::<E>()?.retained_items == 0 {
+        let required = if E::DELIVERY == Delivery::Latest {
+            2
+        } else {
+            1
+        };
+        if self.stream_limits::<E>()?.retained_items < required {
             return Err(TopicError::Capacity);
         }
         Ok(DynamicSender {
@@ -308,13 +320,17 @@ impl Grant {
         })
     }
 
-    /// Acquires a subscription at the current tail. Clones share its cursor.
+    /// Acquires an ordered subscription at the current tail. Latest-state
+    /// observers replay the current snapshot, then coalesce unread updates.
+    /// Clones share the subscription's cursor.
     ///
     /// # Errors
     ///
     /// Returns [`TopicError`] for missing role rights, revocation, a closed or
     /// incompatible stream, or exhausted subscription/notification capacity.
     /// Required membership needs both observation and required-receiver rights.
+    /// Latest-state streams reject required subscriptions with
+    /// [`TopicError::InvalidConfig`].
     ///
     /// # Panics
     ///
@@ -324,6 +340,9 @@ impl Grant {
         E: EventSpec + 'static,
         E::Payload: Send + Sync + 'static,
     {
+        if E::DELIVERY == Delivery::Latest && role == SubscriptionRole::Required {
+            return Err(TopicError::InvalidConfig);
+        }
         let rights = match role {
             SubscriptionRole::Observer => Rights::OBSERVE,
             SubscriptionRole::Required => Rights::OBSERVE.union(Rights::REQUIRED),
@@ -349,7 +368,11 @@ impl Grant {
                 .ok_or(TopicError::Capacity)?;
             let id = state.next_cursor;
             let next_id = id.checked_add(1).ok_or(TopicError::Capacity)?;
-            let next = state.tail;
+            let next = if E::DELIVERY == Delivery::Latest {
+                state.tail.saturating_sub(1)
+            } else {
+                state.tail
+            };
             state.next_cursor = next_id;
             state.subscribers[index] = Some(Cursor {
                 id,
@@ -435,6 +458,7 @@ struct State<T> {
     next_cursor: u64,
     closed: bool,
     needs_room: bool,
+    retired: Option<Entry<T>>,
 }
 
 impl<T> State<T> {
@@ -457,6 +481,7 @@ impl<T> State<T> {
 struct Stream<T> {
     config: StreamConfig,
     wire_major: crate::WireMajor,
+    delivery: Delivery,
     state: Mutex<State<T>>,
     changed: Arc<Notify>,
     contended: AtomicBool,
@@ -503,6 +528,14 @@ impl<T> Stream<T> {
     }
 
     fn maintain(&self) {
+        if self.delivery == Delivery::Latest {
+            let retired = self.try_lock().ok().and_then(|mut state| {
+                let retired = state.retired.take();
+                state.dirty |= retired.is_some();
+                retired
+            });
+            drop(retired);
+        }
         self.retire_consumed();
         let retired = self.try_lock().ok().and_then(|mut state| {
             if state.needs_room
@@ -546,6 +579,9 @@ impl<T> Stream<T> {
     }
 
     fn retire_consumed(&self) {
+        if self.delivery == Delivery::Latest {
+            return;
+        }
         for _ in 0..self.config.capacity {
             let retired = {
                 let Ok(mut state) = self.try_lock() else {
@@ -668,6 +704,9 @@ where
             Err(_) => return Err(TrySendError::Revoked(value)),
         };
         drop(operation);
+        if self.stream.delivery == Delivery::Latest {
+            self.stream.maintain();
+        }
         for _ in 0..=self.stream.config.capacity {
             if self.grant.is_revoked() {
                 return Err(TrySendError::Revoked(value));
@@ -700,6 +739,9 @@ where
             ) {
                 Ok(lease) => return Ok((value, lease)),
                 Err(TopicError::Revoked) => return Err(TrySendError::Revoked(value)),
+                Err(_) if self.stream.delivery == Delivery::Latest => {
+                    return Err(TrySendError::Full(value));
+                }
                 Err(_) => {
                     let retired = {
                         let Ok(mut state) = self.stream.try_lock() else {
@@ -769,10 +811,19 @@ where
                     return Err(TrySendError::Full((value, lease)));
                 }
                 if deferred {
-                    state.needs_room = true;
-                    return Err(TrySendError::MaintenanceRequired((value, lease)));
+                    if self.stream.delivery == Delivery::Latest {
+                        if state.retired.is_some() {
+                            return Err(TrySendError::MaintenanceRequired((value, lease)));
+                        }
+                        state.retired = state.entries.pop_front();
+                        None
+                    } else {
+                        state.needs_room = true;
+                        return Err(TrySendError::MaintenanceRequired((value, lease)));
+                    }
+                } else {
+                    state.entries.pop_front()
                 }
-                state.entries.pop_front()
             } else {
                 None
             };
@@ -875,6 +926,8 @@ where
     /// # Errors
     /// Rejection returns this preparation unchanged. `MaintenanceRequired` means
     /// an eligible retained entry must be reclaimed before retrying.
+    /// Latest-state replacement retains one retired snapshot until maintenance;
+    /// a second replacement needs that slot reclaimed first.
     pub fn try_send(self) -> Result<(), TrySendError<Self>> {
         let Self {
             sender,
@@ -929,6 +982,19 @@ where
 
     async fn send(&self, value: E::Payload) -> Result<(), SendError<E::Payload>> {
         self.send(value).await
+    }
+}
+
+impl<E> SendEventSender<E> for DynamicSender<E>
+where
+    E: EventSpec + 'static,
+    E::Payload: Send + Sync + 'static,
+{
+    fn send_future(
+        &self,
+        value: E::Payload,
+    ) -> impl Future<Output = Result<(), SendError<E::Payload>>> + Send {
+        self.send(value)
     }
 }
 
@@ -1038,7 +1104,11 @@ where
                 .as_ref()
                 .filter(|cursor| cursor.id == key.id)
                 .ok_or(ReceiveError::Closed(CloseReason::Closed))?;
-            let next = cursor.next;
+            let next = if self.inner.stream.delivery == Delivery::Latest {
+                cursor.next.max(state.tail.saturating_sub(1))
+            } else {
+                cursor.next
+            };
             let head = state
                 .entries
                 .front()
@@ -1131,5 +1201,17 @@ where
 
     async fn event_recv(&self) -> Result<StreamItem<Self::Value>, ReceiveError> {
         self.recv().await
+    }
+}
+
+impl<E> SendEventReceiver<E> for DynamicReceiver<E>
+where
+    E: EventSpec + 'static,
+    E::Payload: Send + Sync + 'static,
+{
+    fn event_recv_future(
+        &self,
+    ) -> impl Future<Output = Result<StreamItem<Self::Value>, ReceiveError>> + Send {
+        self.recv()
     }
 }

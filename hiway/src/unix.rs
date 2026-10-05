@@ -4,6 +4,7 @@ use std::{
     io,
     pin::Pin,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
@@ -21,6 +22,90 @@ use crate::{
 const HEADER_BYTES: usize = 38;
 const CREDIT_BYTES: usize = 9;
 const MAGIC: [u8; 4] = *b"HWY1";
+
+use crate::transport::{Accountability, Connection, Contract, Direction, Error, Record};
+
+/// Caller-drained, eight-record history for one host-provisioned Unix link.
+/// Clones share the FIFO. The handle survives link completion or cancellation.
+/// Access uses a mutex; this Tokio backend is not the strict I/O path.
+/// I/O rejection codes use the raw OS error, or zero when none is available.
+#[derive(Clone)]
+pub struct UnixAccountability(Arc<Mutex<Accountability>>);
+
+impl UnixAccountability {
+    fn new<E: WireCodec>(connection: Connection, direction: Direction) -> Self {
+        Self(Arc::new(Mutex::new(Accountability::new(
+            connection,
+            Contract::of::<E>(),
+            direction,
+        ))))
+    }
+
+    /// Removes the oldest retained record.
+    ///
+    /// # Panics
+    /// Panics if the accountability mutex is poisoned.
+    #[must_use]
+    pub fn pop_record(&self) -> Option<Record> {
+        self.0.lock().unwrap().pop()
+    }
+
+    /// Returns the number of overwritten records.
+    ///
+    /// # Panics
+    /// Panics if the accountability mutex is poisoned.
+    #[must_use]
+    pub fn lost_records(&self) -> u64 {
+        self.0.lock().unwrap().lost()
+    }
+}
+
+struct Trace(Option<UnixAccountability>);
+
+impl Trace {
+    fn observe(&self, sequence: u64) {
+        if let Some(trace) = &self.0 {
+            trace.0.lock().unwrap().observe(sequence);
+        }
+    }
+    fn admitted(&self) {
+        if let Some(trace) = &self.0 {
+            trace.0.lock().unwrap().admitted();
+        }
+    }
+    fn completed(&self, sequence: u64) {
+        if let Some(trace) = &self.0 {
+            trace.0.lock().unwrap().completed(sequence);
+        }
+    }
+    fn finish(&self, result: &Result<(), IpcError>) {
+        if let (Some(trace), Err(error)) = (&self.0, result) {
+            let mut trace = trace.0.lock().unwrap();
+            match error {
+                IpcError::Revoked => trace.cancel(),
+                IpcError::Io(error) => trace.finish(Error::Io(error.raw_os_error().unwrap_or(0))),
+                IpcError::Topic(error) => trace.finish(Error::Topic(*error)),
+                IpcError::Wire(error) => trace.finish(Error::Wire(*error)),
+                IpcError::Receive(error) => trace.finish(Error::Receive(*error)),
+                IpcError::Send(error) => trace.finish(Error::Send(*error)),
+                IpcError::Protocol => trace.finish(Error::Protocol),
+                IpcError::Oversized { .. } => trace.finish(Error::Capacity),
+                IpcError::Gap { from, to } => trace.finish(Error::Gap {
+                    from: *from,
+                    to: *to,
+                }),
+            }
+        }
+    }
+}
+
+impl Drop for Trace {
+    fn drop(&mut self) {
+        if let Some(trace) = &self.0 {
+            trace.0.lock().unwrap().cancel();
+        }
+    }
+}
 
 /// Failure of one pre-authorized, unidirectional IPC link.
 #[derive(Debug)]
@@ -96,6 +181,15 @@ impl From<io::Error> for IpcError {
     }
 }
 
+impl From<crate::DecodeError> for IpcError {
+    fn from(error: crate::DecodeError) -> Self {
+        match error {
+            crate::DecodeError::Wire(error) => Self::Wire(error),
+            crate::DecodeError::Resources(error) => Self::Topic(error),
+        }
+    }
+}
+
 type Driver = Pin<Box<dyn Future<Output = Result<(), IpcError>> + Send>>;
 
 /// Caller-driven link between explicitly authorized endpoints.
@@ -150,6 +244,7 @@ impl UnixLink {
     /// Exports a local stream through sockets supplied by the composition root.
     ///
     /// `Observer` cannot backpressure the source and terminates on a visible gap.
+    /// Latest-state events replay and coalesce complete snapshots without gaps.
     /// `Required` needs the grant's required-membership right. Local publication
     /// success never implies remote delivery, even when this link is required.
     ///
@@ -173,12 +268,56 @@ impl UnixLink {
         Self::export_io::<E>(grant, data, control, role, max_payload)
     }
 
+    /// Exports with bounded accountability attributed to the supplied host ID
+    /// and generation. The host must not reuse that pair within its domain.
+    ///
+    /// # Errors
+    /// Returns the same construction errors as [`Self::export`].
+    pub fn export_tracked<E>(
+        grant: Grant,
+        data: UnixStream,
+        control: UnixStream,
+        role: SubscriptionRole,
+        max_payload: usize,
+        connection: Connection,
+    ) -> Result<(Self, UnixAccountability), IpcError>
+    where
+        E: WireCodec + 'static,
+        E::Payload: Send + Sync + 'static,
+    {
+        let trace = UnixAccountability::new::<E>(connection, Direction::Export);
+        let link = Self::export_with_trace::<E>(
+            grant,
+            data,
+            control,
+            role,
+            max_payload,
+            Some(trace.clone()),
+        )?;
+        Ok((link, trace))
+    }
+
     fn export_io<E>(
         grant: Grant,
         data: impl AsyncWrite + Unpin + Send + 'static,
         control: impl AsyncRead + Unpin + Send + 'static,
         role: SubscriptionRole,
         max_payload: usize,
+    ) -> Result<Self, IpcError>
+    where
+        E: WireCodec + 'static,
+        E::Payload: Send + Sync + 'static,
+    {
+        Self::export_with_trace::<E>(grant, data, control, role, max_payload, None)
+    }
+
+    fn export_with_trace<E>(
+        grant: Grant,
+        data: impl AsyncWrite + Unpin + Send + 'static,
+        control: impl AsyncRead + Unpin + Send + 'static,
+        role: SubscriptionRole,
+        max_payload: usize,
+        trace: Option<UnixAccountability>,
     ) -> Result<Self, IpcError>
     where
         E: WireCodec + 'static,
@@ -194,15 +333,18 @@ impl UnixLink {
             .map_err(IpcError::Topic)?;
         let receiver = grant.subscribe::<E>(role).map_err(IpcError::Topic)?;
         let buffer = payload_buffer(max_payload)?;
+        let trace = Trace(trace);
         let future = async move {
             let _lease = lease;
             let credits = Credits::default();
-            tokio::select! {
+            let result = tokio::select! {
                 biased;
                 () = revoked(&grant) => Err(IpcError::Revoked),
-                result = receive_credits(control, &credits) => result,
-                result = export_data::<E>(data, receiver, buffer, &credits) => result,
-            }
+                result = receive_credits(control, &credits, &trace) => result,
+                result = export_data::<E>(data, receiver, buffer, &credits, &trace) => result,
+            };
+            trace.finish(&result);
+            result
         };
         Ok(Self {
             future: Some(Box::pin(future)),
@@ -233,11 +375,54 @@ impl UnixLink {
         Self::import_io::<E, _, _>(grant, data, move || control.into_split(), max_payload)
     }
 
+    /// Imports with bounded accountability attributed to the supplied host ID
+    /// and generation. The host must not reuse that pair within its domain.
+    ///
+    /// # Errors
+    /// Returns the same construction errors as [`Self::import`].
+    pub fn import_tracked<E>(
+        grant: Grant,
+        data: UnixStream,
+        control: UnixStream,
+        max_payload: usize,
+        connection: Connection,
+    ) -> Result<(Self, UnixAccountability), IpcError>
+    where
+        E: WireCodec + 'static,
+        E::Payload: Send + Sync + 'static,
+    {
+        let trace = UnixAccountability::new::<E>(connection, Direction::Import);
+        let link = Self::import_with_trace::<E, _, _>(
+            grant,
+            data,
+            move || control.into_split(),
+            max_payload,
+            Some(trace.clone()),
+        )?;
+        Ok((link, trace))
+    }
+
     fn import_io<E, R, W>(
         grant: Grant,
         data: impl AsyncRead + Unpin + Send + 'static,
         split_control: impl FnOnce() -> (R, W) + Send + 'static,
         max_payload: usize,
+    ) -> Result<Self, IpcError>
+    where
+        E: WireCodec + 'static,
+        E::Payload: Send + Sync + 'static,
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::import_with_trace::<E, R, W>(grant, data, split_control, max_payload, None)
+    }
+
+    fn import_with_trace<E, R, W>(
+        grant: Grant,
+        data: impl AsyncRead + Unpin + Send + 'static,
+        split_control: impl FnOnce() -> (R, W) + Send + 'static,
+        max_payload: usize,
+        trace: Option<UnixAccountability>,
     ) -> Result<Self, IpcError>
     where
         E: WireCodec + 'static,
@@ -253,15 +438,18 @@ impl UnixLink {
             .map_err(IpcError::Topic)?;
         let sender = grant.sender::<E>().map_err(IpcError::Topic)?;
         let buffer = payload_buffer(max_payload)?;
+        let trace = Trace(trace);
         let future = async move {
             let _lease = lease;
             let (mut control_read, control_write) = split_control();
-            tokio::select! {
+            let result = tokio::select! {
                 biased;
                 () = revoked(&grant) => Err(IpcError::Revoked),
                 result = reject_control(&mut control_read) => result,
-                result = import_data::<E>(data, control_write, sender, buffer) => result,
-            }
+                result = import_data::<E>(data, control_write, sender, buffer, &grant, &trace) => result,
+            };
+            trace.finish(&result);
+            result
         };
         Ok(Self {
             future: Some(Box::pin(future)),
@@ -332,6 +520,7 @@ async fn revoked(grant: &Grant) {
 #[derive(Default)]
 struct Credits {
     outstanding: AtomicBool,
+    sent: AtomicBool,
     sequence: AtomicU64,
     changed: Notify,
 }
@@ -353,6 +542,7 @@ impl Credits {
 async fn receive_credits(
     mut control: impl AsyncRead + Unpin,
     credits: &Credits,
+    trace: &Trace,
 ) -> Result<(), IpcError> {
     loop {
         let mut frame = [0; CREDIT_BYTES];
@@ -364,6 +554,9 @@ async fn receive_credits(
             || !credits.outstanding.swap(false, Ordering::AcqRel)
         {
             return Err(IpcError::Protocol);
+        }
+        if credits.sent.load(Ordering::Acquire) {
+            trace.completed(sequence);
         }
         credits.changed.notify_one();
         tokio::task::yield_now().await;
@@ -386,6 +579,7 @@ async fn export_data<E>(
     receiver: DynamicReceiver<E>,
     mut buffer: Vec<u8>,
     credits: &Credits,
+    trace: &Trace,
 ) -> Result<(), IpcError>
 where
     E: WireCodec + 'static,
@@ -397,6 +591,7 @@ where
             StreamItem::Data { sequence, value } => (sequence, value),
             StreamItem::Gap { from, to } => return Err(IpcError::Gap { from, to }),
         };
+        trace.observe(sequence);
         let length = E::encoded_len(&payload);
         if length > buffer.len() {
             return Err(IpcError::Oversized {
@@ -411,9 +606,15 @@ where
         let header = encode_header::<E>(sequence, length).map_err(IpcError::Wire)?;
         drop(payload);
         credits.sequence.store(sequence, Ordering::Release);
+        credits.sent.store(false, Ordering::Release);
         credits.outstanding.store(true, Ordering::Release);
+        trace.admitted();
         data.write_all(&header).await?;
         data.write_all(&buffer[..length]).await?;
+        credits.sent.store(true, Ordering::Release);
+        if !credits.outstanding.load(Ordering::Acquire) {
+            trace.completed(sequence);
+        }
         tokio::task::yield_now().await;
     }
 }
@@ -423,6 +624,8 @@ async fn import_data<E>(
     mut control: impl AsyncWrite + Unpin,
     sender: DynamicSender<E>,
     mut buffer: Vec<u8>,
+    grant: &Grant,
+    trace: &Trace,
 ) -> Result<(), IpcError>
 where
     E: WireCodec + 'static,
@@ -432,20 +635,26 @@ where
     loop {
         let mut header = [0; HEADER_BYTES];
         data.read_exact(&mut header).await?;
+        trace.observe(u64::from_le_bytes(
+            header[26..34].try_into().expect("fixed sequence field"),
+        ));
         let (sequence, revision, length) = decode_header::<E>(&header, buffer.len())?;
-        if previous.is_some_and(|last| last.checked_add(1) != Some(sequence)) {
+        if previous.is_some_and(|last| !E::DELIVERY.follows(last, sequence)) {
             return Err(IpcError::Protocol);
         }
         data.read_exact(&mut buffer[..length]).await?;
-        let payload = E::decode(&buffer[..length], revision).map_err(IpcError::Wire)?;
+        let payload =
+            E::decode_with_resources(&buffer[..length], revision, grant).map_err(IpcError::from)?;
         sender
             .send(payload)
             .await
             .map_err(|error| IpcError::Send(error.map(|_| ())))?;
         previous = Some(sequence);
+        trace.admitted();
         let mut credit = [1; CREDIT_BYTES];
         credit[1..].copy_from_slice(&sequence.to_le_bytes());
         control.write_all(&credit).await?;
+        trace.completed(sequence);
         tokio::task::yield_now().await;
     }
 }

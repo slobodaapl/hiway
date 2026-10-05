@@ -36,6 +36,70 @@ impl fmt::Display for WireError {
 #[cfg(feature = "std")]
 impl std::error::Error for WireError {}
 
+/// Codec rejection or failure to reserve decoded resources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// Invalid encoding or unsupported schema revision.
+    Wire(WireError),
+    /// The host's resource allowance rejected the reservation.
+    Resources(crate::TopicError),
+}
+
+impl From<WireError> for DecodeError {
+    fn from(error: WireError) -> Self {
+        Self::Wire(error)
+    }
+}
+
+impl From<crate::TopicError> for DecodeError {
+    fn from(error: crate::TopicError) -> Self {
+        Self::Resources(error)
+    }
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Wire(error) => error.fmt(formatter),
+            Self::Resources(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Wire(error) => Some(error),
+            Self::Resources(error) => Some(error),
+        }
+    }
+}
+
+/// Owned decoding authority, used outside transport borrows and strict I/O.
+/// `()` uses the plain codec; a `Grant` supplies resource reservation authority.
+pub trait DecodeContext {
+    /// Decodes under this context's resource policy.
+    ///
+    /// # Errors
+    /// Returns codec or resource reservation rejection.
+    fn decode<E: WireCodec>(
+        &self,
+        bytes: &[u8],
+        revision: SchemaRevision,
+    ) -> Result<E::Payload, DecodeError>;
+}
+
+impl DecodeContext for () {
+    fn decode<E: WireCodec>(
+        &self,
+        bytes: &[u8],
+        revision: SchemaRevision,
+    ) -> Result<E::Payload, DecodeError> {
+        E::decode(bytes, revision).map_err(DecodeError::Wire)
+    }
+}
+
 /// Fixed-size header preceding one encoded payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnvelopeHeader {
@@ -211,4 +275,21 @@ pub trait WireCodec: EventSpec {
     /// is unsupported, or [`WireError::InvalidPayload`] if `bytes` do not encode
     /// a valid payload for that revision.
     fn decode(bytes: &[u8], revision: SchemaRevision) -> Result<Self::Payload, WireError>;
+
+    /// Decodes using the host's resource allowance. Resource-aware codecs must
+    /// determine a bounded cost, reserve before allocating, and attach the
+    /// reservation to the returned payload or its retained resources. This runs
+    /// outside strict I/O. Native codecs and their cost declarations are trusted.
+    /// The default preserves legacy decoding without resource accounting.
+    ///
+    /// # Errors
+    /// Returns codec rejection or resource quota/authority rejection.
+    #[cfg(feature = "std")]
+    fn decode_with_resources(
+        bytes: &[u8],
+        revision: SchemaRevision,
+        _resources: &crate::Grant,
+    ) -> Result<Self::Payload, DecodeError> {
+        Self::decode(bytes, revision).map_err(DecodeError::Wire)
+    }
 }

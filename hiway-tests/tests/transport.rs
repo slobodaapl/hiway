@@ -317,7 +317,14 @@ fn complete_frames_and_every_byte_split_preserve_credit_and_sequence() {
         assert_eq!(p.effect(Lane::CreditSend), None);
         p.input(Input::Admitted).unwrap();
         assert_eq!(p.credit(), [1, 19, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(p.effect(Lane::Data), None);
+        assert_eq!(
+            p.effect(Lane::Data),
+            Some(Effect::Receive {
+                lane: Lane::Data,
+                offset: 0,
+                length: capacity,
+            })
+        );
         finish(&mut p, &mut generation, Lane::CreditSend, 9, &[]);
         let mut next = frame;
         encode_frame::<Number>(20, &91, &mut next).unwrap();
@@ -419,33 +426,35 @@ fn combined_receive_rejects_duplicate_skipped_and_wrapped_sequences() {
 }
 
 #[test]
-fn every_header_split_preserves_admission_credit() {
+fn every_frame_split_preserves_admission_credit() {
     let mut frame = [0; 64];
     let length = encode_frame::<Number>(19, &73, &mut frame).unwrap();
-    for split in 1..HEADER_BYTES {
+    for split in 1..=length {
         let mut p = machine(Direction::Import);
         let mut generation = 0;
         let pending = p.effect(Lane::Data);
         assert_eq!(p.effect(Lane::Data), pending);
-        finish(&mut p, &mut generation, Lane::Data, split, &frame);
-        assert!(
-            matches!(p.effect(Lane::Data), Some(Effect::Receive { offset, length, .. })
-            if offset == split && length >= HEADER_BYTES - split && length <= frame.len() - split)
-        );
-        finish(
-            &mut p,
-            &mut generation,
-            Lane::Data,
-            HEADER_BYTES - split,
-            &frame,
-        );
-        finish(
-            &mut p,
-            &mut generation,
-            Lane::Data,
-            length - HEADER_BYTES,
-            &frame,
-        );
+        finish(&mut p, &mut generation, Lane::Data, split, &frame[..split]);
+        if split < length {
+            let Some(Effect::Receive {
+                offset,
+                length: available,
+                ..
+            }) = p.effect(Lane::Data)
+            else {
+                panic!("partial frame must remain receivable");
+            };
+            assert_eq!(offset, split);
+            assert!(available >= length - split && available <= frame.len() - split);
+            assert_eq!(p.effect(Lane::CreditSend), None);
+            finish(
+                &mut p,
+                &mut generation,
+                Lane::Data,
+                length - split,
+                &frame[..length],
+            );
+        }
         assert_eq!(
             p.effect(Lane::Data),
             Some(Effect::Admit {
@@ -465,9 +474,273 @@ fn every_header_split_preserves_admission_credit() {
                 length: 6
             })
         );
-        assert_eq!(p.effect(Lane::Data), None);
+        assert_eq!(p.effect(Lane::Data), pending);
         finish(&mut p, &mut generation, Lane::CreditSend, 6, &[]);
         assert_eq!(p.effect(Lane::Data), pending);
+    }
+}
+
+#[test]
+fn fragmented_and_coalesced_frames_cover_empty_capacity_and_sequence_boundaries() {
+    for fragmented in [false, true] {
+        let mut p = machine(Direction::Import);
+        let mut generation = 0;
+        for (sequence, payload) in [(u64::MAX - 2, 0usize), (u64::MAX - 1, 26), (u64::MAX, 4)] {
+            let mut frame = [0; 64];
+            encode_frame::<Number>(sequence, &73, &mut frame).unwrap();
+            frame[34..38].copy_from_slice(&u32::try_from(payload).unwrap().to_le_bytes());
+            let total = HEADER_BYTES + payload;
+            if fragmented {
+                for end in 1..=total {
+                    finish(&mut p, &mut generation, Lane::Data, 1, &frame[..end]);
+                    if end < total {
+                        assert!(matches!(p.effect(Lane::Data), Some(Effect::Receive { .. })));
+                        assert_eq!(p.effect(Lane::CreditSend), None);
+                    }
+                }
+            } else {
+                finish(&mut p, &mut generation, Lane::Data, total, &frame[..total]);
+            }
+            assert_eq!(
+                p.effect(Lane::Data),
+                Some(Effect::Admit {
+                    length: payload,
+                    revision: SchemaRevision(1),
+                })
+            );
+            p.input(Input::Admitted).unwrap();
+            assert_eq!(&p.credit()[1..], &sequence.to_le_bytes());
+            finish(&mut p, &mut generation, Lane::CreditSend, 9, &[]);
+        }
+        let mut frame = [0; 64];
+        let total = encode_frame::<Number>(0, &73, &mut frame).unwrap();
+        let op = OpId {
+            slot: 0,
+            generation: generation + 1,
+        };
+        p.input(Input::Accepted {
+            lane: Lane::Data,
+            op,
+        })
+        .unwrap();
+        assert_eq!(
+            p.input(Input::Completed {
+                op,
+                result: IoResult::Bytes(total),
+                buffer: &frame[..total],
+            }),
+            Err(Error::Protocol)
+        );
+        assert_eq!(p.closed(), Some(Error::Protocol));
+        assert_eq!(p.effect(Lane::CreditSend), None);
+    }
+}
+
+#[test]
+fn coalesced_receive_rejects_bytes_past_the_declared_frame() {
+    let mut frame = [0; 64];
+    let length = encode_frame::<Number>(19, &73, &mut frame).unwrap();
+    let mut p = machine(Direction::Import);
+    let op = OpId {
+        slot: 0,
+        generation: 1,
+    };
+    p.input(Input::Accepted {
+        lane: Lane::Data,
+        op,
+    })
+    .unwrap();
+    assert_eq!(
+        p.input(Input::Completed {
+            op,
+            result: IoResult::Bytes(length + 1),
+            buffer: &frame[..=length],
+        }),
+        Err(Error::Protocol)
+    );
+    assert_eq!(p.closed(), Some(Error::Protocol));
+    assert_eq!(p.effect(Lane::Data), None);
+    assert_eq!(p.effect(Lane::CreditSend), None);
+}
+
+#[test]
+fn next_receive_overlaps_credit_without_early_admission_or_sequence_overwrite() {
+    for data_first in [false, true] {
+        for partial_credit in [false, true] {
+            let mut p = machine(Direction::Import);
+            let mut generation = 0;
+            let mut frame = [0; 64];
+            let length = encode_frame::<Number>(19, &73, &mut frame).unwrap();
+            finish(&mut p, &mut generation, Lane::Data, length, &frame);
+            p.input(Input::Admitted).unwrap();
+            let data = OpId {
+                slot: 0,
+                generation: 2,
+            };
+            let mut credit = OpId {
+                slot: 1,
+                generation: 3,
+            };
+            p.input(Input::Accepted {
+                lane: Lane::Data,
+                op: data,
+            })
+            .unwrap();
+            p.input(Input::Accepted {
+                lane: Lane::CreditSend,
+                op: credit,
+            })
+            .unwrap();
+            let remaining = if partial_credit {
+                p.input(Input::Completed {
+                    op: credit,
+                    result: IoResult::Bytes(3),
+                    buffer: &[],
+                })
+                .unwrap();
+                assert_eq!(
+                    p.effect(Lane::CreditSend),
+                    Some(Effect::Transmit {
+                        lane: Lane::CreditSend,
+                        offset: 3,
+                        length: 6,
+                    })
+                );
+                credit.generation += 1;
+                p.input(Input::Accepted {
+                    lane: Lane::CreditSend,
+                    op: credit,
+                })
+                .unwrap();
+                6
+            } else {
+                9
+            };
+            encode_frame::<Number>(20, &74, &mut frame).unwrap();
+            let next_data = Input::Completed {
+                op: data,
+                result: IoResult::Bytes(length),
+                buffer: &frame,
+            };
+            let prior_credit = Input::Completed {
+                op: credit,
+                result: IoResult::Bytes(remaining),
+                buffer: &[],
+            };
+            if data_first {
+                p.input(next_data).unwrap();
+                assert_eq!(p.effect(Lane::Data), None);
+                assert_eq!(&p.credit()[1..], &19u64.to_le_bytes());
+                p.input(prior_credit).unwrap();
+            } else {
+                p.input(prior_credit).unwrap();
+                p.input(next_data).unwrap();
+            }
+            assert_eq!(
+                p.effect(Lane::Data),
+                Some(Effect::Admit {
+                    length: 4,
+                    revision: SchemaRevision(1),
+                })
+            );
+            assert_eq!(p.effect(Lane::CreditSend), None);
+            p.input(Input::Admitted).unwrap();
+            assert_eq!(&p.credit()[1..], &20u64.to_le_bytes());
+        }
+    }
+}
+
+#[test]
+fn a_next_frame_cannot_replace_or_bypass_an_unsubmitted_admission_credit() {
+    let mut p = machine(Direction::Import);
+    let mut generation = 0;
+    let mut frame = [0; 64];
+    let length = encode_frame::<Number>(19, &73, &mut frame).unwrap();
+    finish(&mut p, &mut generation, Lane::Data, length, &frame);
+    p.input(Input::Admitted).unwrap();
+    encode_frame::<Number>(20, &74, &mut frame).unwrap();
+    finish(&mut p, &mut generation, Lane::Data, length, &frame);
+    assert_eq!(p.effect(Lane::Data), None);
+    assert_eq!(
+        p.effect(Lane::CreditSend),
+        Some(Effect::Transmit {
+            lane: Lane::CreditSend,
+            offset: 0,
+            length: 9,
+        })
+    );
+    assert_eq!(&p.credit()[1..], &19u64.to_le_bytes());
+    assert_eq!(p.input(Input::Admitted), Err(Error::Protocol));
+    assert_eq!(p.closed(), Some(Error::Protocol));
+    assert_eq!(p.effect(Lane::CreditSend), None);
+}
+
+#[test]
+fn failure_of_an_overlapping_credit_preserves_the_other_operation_until_completion() {
+    for revoked in [false, true] {
+        let mut p = machine(Direction::Import);
+        let mut generation = 0;
+        let mut frame = [0; 64];
+        let length = encode_frame::<Number>(19, &73, &mut frame).unwrap();
+        finish(&mut p, &mut generation, Lane::Data, length, &frame);
+        p.input(Input::Admitted).unwrap();
+        let data = OpId {
+            slot: 0,
+            generation: 2,
+        };
+        let credit = OpId {
+            slot: 1,
+            generation: 3,
+        };
+        p.input(Input::Accepted {
+            lane: Lane::Data,
+            op: data,
+        })
+        .unwrap();
+        p.input(Input::Accepted {
+            lane: Lane::CreditSend,
+            op: credit,
+        })
+        .unwrap();
+        if revoked {
+            p.input(Input::Revoked).unwrap();
+            assert_eq!(
+                p.effect(Lane::CreditSend),
+                Some(Effect::Cancel {
+                    lane: Lane::CreditSend,
+                    target: credit,
+                })
+            );
+        }
+        let result = p.input(Input::Completed {
+            op: credit,
+            result: IoResult::Failed(32),
+            buffer: &[],
+        });
+        assert_eq!(result, if revoked { Ok(()) } else { Err(Error::Io(32)) });
+        assert_eq!(p.effect(Lane::CreditSend), None);
+        assert_eq!(
+            p.effect(Lane::Data),
+            Some(Effect::Cancel {
+                lane: Lane::Data,
+                target: data,
+            })
+        );
+        p.input(Input::Completed {
+            op: data,
+            result: IoResult::Bytes(length),
+            buffer: &frame,
+        })
+        .unwrap();
+        assert_eq!(p.effect(Lane::Data), None);
+        assert_eq!(
+            p.closed(),
+            Some(if revoked {
+                Error::Revoked
+            } else {
+                Error::Io(32)
+            })
+        );
     }
 }
 

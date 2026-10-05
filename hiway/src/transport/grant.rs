@@ -1,4 +1,4 @@
-use super::{Contract, Direction, Reservation};
+use super::{Contract, Direction, Reservation, StrictReservation};
 use crate::{
     grant::{Lease, Operation},
     EventSpec, Grant, Limits, Rights, TopicError,
@@ -79,5 +79,24 @@ impl Reservation for GrantReservation {
     }
     fn is_revoked(&self) -> bool {
         self.grant.is_revoked()
+    }
+
+    fn decode_context(&self) -> impl crate::DecodeContext + 'static {
+        self.grant.clone()
+    }
+
+    fn maintain(&self) {
+        self.grant.maintain_operations();
+    }
+}
+
+impl super::sealed::StrictReservation for GrantReservation {}
+impl StrictReservation for GrantReservation {
+    fn enter_deferred(&self) -> Result<GrantAccess, TopicError> {
+        self.grant
+            .enter_deferred(self.contract.event, self.rights)
+            .map(|operation| GrantAccess {
+                _operation: operation,
+            })
     }
 }
